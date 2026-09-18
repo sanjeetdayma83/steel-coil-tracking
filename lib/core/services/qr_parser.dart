@@ -27,13 +27,11 @@ class QrParser {
 
   static ParsedQr parse(String raw) {
     final cleaned = raw.trim();
-
     if (cleaned.isEmpty) {
       throw const FormatException('QR data is empty.');
     }
 
     final parts = cleaned.split(',');
-
     if (parts.length < 2) {
       throw const FormatException(
         'QR does not contain Material Code and Coil No.',
@@ -42,11 +40,9 @@ class QrParser {
 
     final materialCode = parts[0].trim();
     final coilNo = parts[1].trim();
-
     if (materialCode.isEmpty) {
       throw const FormatException('Material Code is empty.');
     }
-
     if (coilNo.isEmpty) {
       throw const FormatException('Coil No is empty.');
     }
@@ -54,11 +50,22 @@ class QrParser {
     double? thickness;
     double? width;
 
-    final sizeMatch = _sizePattern.firstMatch(cleaned);
+    // Prefer 4th CSV field: 0.880X624
+    if (parts.length >= 4) {
+      final sizeMatch = _sizePattern.firstMatch(parts[3].trim());
+      if (sizeMatch != null) {
+        thickness = _toDouble(sizeMatch.group(1));
+        width = _toDouble(sizeMatch.group(2));
+      }
+    }
 
-    if (sizeMatch != null) {
-      thickness = _toDouble(sizeMatch.group(1));
-      width = _toDouble(sizeMatch.group(2));
+    // Fallback: search whole QR
+    if (thickness == null || width == null) {
+      final sizeMatch = _sizePattern.firstMatch(cleaned);
+      if (sizeMatch != null) {
+        thickness = _toDouble(sizeMatch.group(1));
+        width = _toDouble(sizeMatch.group(2));
+      }
     }
 
     return ParsedQr(

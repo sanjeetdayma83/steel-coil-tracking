@@ -1,4 +1,4 @@
-import 'dart:async';
+﻿import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -314,6 +314,8 @@ class _ScanCoilScreenState extends State<ScanCoilScreen>
           _error = 'INVALID QR: $error';
         });
 
+        SystemSound.play(SystemSoundType.click);
+        HapticFeedback.heavyImpact();
         _showScanMessagePopup(
           title: 'INVALID QR',
           message: 'This QR code is not a valid coil QR.',
@@ -335,6 +337,8 @@ class _ScanCoilScreenState extends State<ScanCoilScreen>
           _error = 'INVALID COIL: Coil number is missing.';
         });
 
+        SystemSound.play(SystemSoundType.click);
+        HapticFeedback.heavyImpact();
         _showScanMessagePopup(
           title: 'INVALID COIL',
           message: 'Coil number is missing from this QR code.',
@@ -350,6 +354,8 @@ class _ScanCoilScreenState extends State<ScanCoilScreen>
     // ========================================================
     if (_sessionCoils.contains(coilKey)) {
       if (mounted) {
+        SystemSound.play(SystemSoundType.click);
+        HapticFeedback.heavyImpact();
         _showScanMessagePopup(
           title: 'DUPLICATE SCAN',
           message: '$coilKey\n\nALREADY SCANNED IN THIS SESSION',
@@ -504,6 +510,8 @@ class _ScanCoilScreenState extends State<ScanCoilScreen>
           if (mounted) {
             // Non-blocking result banner: the camera/scan queue continues
             // immediately while the result remains visible for 2 seconds.
+            SystemSound.play(SystemSoundType.click);
+            HapticFeedback.mediumImpact();
             _showScanResultPopup(
               coilNo: parsed.coilNo,
               thickness: parsed.thickness,
@@ -533,41 +541,24 @@ class _ScanCoilScreenState extends State<ScanCoilScreen>
 
   Future<List<String>> _plannedMachinesForCoil(String coilNo) async {
     final normalized = coilNo.trim().toUpperCase();
-
     if (normalized.isEmpty) return const [];
 
-    // IMPORTANT:
-    // Scan result must use the exact same canonical PPC view
-    // as Check Location.
-    //
-    // This fixes:
-    // Mother = 26T120470A
-    // Slit   = C
-    // Physical Coil = 26T120470C
-    //
-    // and returns exact machine code:
-    // CRS00005
-    final rows = await SupabaseService.client
-        .from('v_active_ppc_coils')
-        .select('physical_coil_no,planned_machine_code');
+    try {
+      final rows = await SupabaseService.client.rpc(
+        'match_planned_machines',
+        params: {'p_coil_no': normalized},
+      );
 
-    final codes = <String>{};
-
-    for (final row in List<Map<String, dynamic>>.from(rows)) {
-      final physical = '${row['physical_coil_no'] ?? ''}'.trim().toUpperCase();
-
-      if (physical != normalized) continue;
-
-      final code = '${row['planned_machine_code'] ?? ''}'.trim();
-
-      if (code.isNotEmpty) {
-        codes.add(code);
+      final codes = <String>{};
+      for (final row in List<Map<String, dynamic>>.from(rows as List)) {
+        final code = '${row['planned_machine_code'] ?? ''}'.trim();
+        if (code.isNotEmpty) codes.add(code);
       }
+      return codes.toList()..sort();
+    } catch (e) {
+      debugPrint('match_planned_machines failed: $e');
+      return const [];
     }
-
-    final result = codes.toList()..sort();
-
-    return result;
   }
 
   void _showScanResultPopup({

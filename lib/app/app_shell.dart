@@ -281,18 +281,15 @@ class _AppShellState extends State<AppShell> {
   }
 
   Widget _page() {
-    switch (_selectedIndex) {
-      case 0:
-        return const UploadPlanScreen();
-      case 1:
-        return ScanCoilScreen(isActive: true);
-      case 2:
-        return const CheckLocationScreen();
-      case 3:
-        return const MasterConfigurationScreen();
-      default:
-        return const UploadPlanScreen();
-    }
+    return IndexedStack(
+      index: _selectedIndex,
+      children: [
+        const UploadPlanScreen(),
+        ScanCoilScreen(isActive: _selectedIndex == 1),
+        const CheckLocationScreen(),
+        const MasterConfigurationScreen(),
+      ],
+    );
   }
 }
 

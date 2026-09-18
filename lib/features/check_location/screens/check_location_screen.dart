@@ -152,9 +152,7 @@ class _CheckLocationScreenState extends State<CheckLocationScreen> {
         final code = '${row['planned_machine_code'] ?? ''}'.trim();
         if (code.isNotEmpty) machines.add(code);
         // also smart-match for scanned-style numbers
-        for (final m in await _plannedMachinesFor(key)) {
-          machines.add(m);
-        }
+
         enriched.add({
           ...row,
           ...?loc,
