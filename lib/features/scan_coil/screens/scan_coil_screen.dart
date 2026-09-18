@@ -43,6 +43,13 @@ class _ScanCoilScreenState extends State<ScanCoilScreen>
 
   final _parser = const QrParserService();
   final Set<String> _sessionCoils = <String>{};
+
+  // Prevent the same coil from entering the DB queue
+  // multiple times while its first save is still running.
+  final Set<String> _inFlightCoils = <String>{};
+
+  // Prevent repeated duplicate popups while the same QR
+  // remains continuously visible to the camera.
   final List<Map<String, dynamic>> _queue = <Map<String, dynamic>>[];
   final List<_ScanViewItem> _recent = <_ScanViewItem>[];
 
@@ -94,8 +101,10 @@ class _ScanCoilScreenState extends State<ScanCoilScreen>
 
     _camera = MobileScannerController(
       autoStart: false,
-      detectionSpeed: DetectionSpeed.noDuplicates,
       formats: const [BarcodeFormat.qrCode],
+      detectionSpeed: DetectionSpeed.noDuplicates,
+      cameraResolution: const Size(1920, 1080),
+      detectionTimeoutMs: 200,
     );
 
     _operatorController = TextEditingController(text: 'Operator');
@@ -294,25 +303,75 @@ class _ScanCoilScreenState extends State<ScanCoilScreen>
   void _handleRawQr(String raw) {
     CoilQrData parsed;
 
+    // ========================================================
+    // STRICT QR VALIDATION
+    // ========================================================
     try {
       parsed = _parser.parse(raw);
     } catch (error) {
       if (mounted) {
         setState(() {
-          _error = 'Invalid QR: $error';
+          _error = 'INVALID QR: $error';
         });
+
+        _showScanMessagePopup(
+          title: 'INVALID QR',
+          message: 'This QR code is not a valid coil QR.',
+        );
       }
+
       HapticFeedback.heavyImpact();
       return;
     }
 
     final coilKey = parsed.coilNo.trim().toUpperCase();
 
-    if (coilKey.isEmpty || _sessionCoils.contains(coilKey)) {
+    // ========================================================
+    // INVALID / EMPTY COIL NUMBER
+    // ========================================================
+    if (coilKey.isEmpty) {
+      if (mounted) {
+        setState(() {
+          _error = 'INVALID COIL: Coil number is missing.';
+        });
+
+        _showScanMessagePopup(
+          title: 'INVALID COIL',
+          message: 'Coil number is missing from this QR code.',
+        );
+      }
+
+      HapticFeedback.heavyImpact();
       return;
     }
 
-    _sessionCoils.add(coilKey);
+    // ========================================================
+    // DUPLICATE - ALREADY SUCCESSFULLY SCANNED
+    // ========================================================
+    if (_sessionCoils.contains(coilKey)) {
+      if (mounted) {
+        _showScanMessagePopup(
+          title: 'DUPLICATE SCAN',
+          message: '$coilKey\n\nALREADY SCANNED IN THIS SESSION',
+        );
+
+        HapticFeedback.heavyImpact();
+      }
+
+      return;
+    }
+
+    // ========================================================
+    // DUPLICATE WHILE DB SAVE IS IN PROGRESS
+    // ========================================================
+    if (_inFlightCoils.contains(coilKey)) {
+      return;
+    }
+
+    // IMPORTANT:
+    // Do NOT add to _sessionCoils here.
+    // It is added only after DB confirms successful save.
+    _inFlightCoils.add(coilKey);
 
     final localSequence = ++_localSequence;
     final item = _ScanViewItem(
@@ -329,6 +388,7 @@ class _ScanCoilScreenState extends State<ScanCoilScreen>
         _lastCoil = parsed.coilNo;
         _error = null;
         _recent.insert(0, item);
+
         if (_recent.length > 15) {
           _recent.removeLast();
         }
@@ -420,6 +480,12 @@ class _ScanCoilScreenState extends State<ScanCoilScreen>
 
           if (!mounted) continue;
 
+          // DB is the source of truth.
+          // Only after successful RPC do we mark this
+          // physical coil as scanned in the current session.
+          _inFlightCoils.remove(parsed.coilNo.trim().toUpperCase());
+          _sessionCoils.add(parsed.coilNo.trim().toUpperCase());
+
           setState(() {
             item.serverSequence = sequence;
             item.saved = true;
@@ -447,10 +513,17 @@ class _ScanCoilScreenState extends State<ScanCoilScreen>
             );
           }
         } catch (error) {
+          // DB/network failure:
+          // release the lock so the same coil can be retried.
+          _inFlightCoils.remove(parsed.coilNo.trim().toUpperCase());
+
           if (!mounted) continue;
+
           setState(() {
             item.error = _friendlyDatabaseError(error);
           });
+
+          HapticFeedback.heavyImpact();
         }
       }
     } finally {
@@ -638,7 +711,100 @@ class _ScanCoilScreenState extends State<ScanCoilScreen>
 
     _scanPopupEntry = entry;
     overlay.insert(entry);
-    _scanPopupTimer = Timer(const Duration(seconds: 2), () {
+    _scanPopupTimer = Timer(const Duration(seconds: 4), () {
+      if (identical(_scanPopupEntry, entry)) {
+        entry.remove();
+        _scanPopupEntry = null;
+      }
+    });
+  }
+
+  void _showScanMessagePopup({required String title, required String message}) {
+    if (!mounted) return;
+
+    _scanPopupTimer?.cancel();
+    _scanPopupEntry?.remove();
+
+    final entry = OverlayEntry(
+      builder: (overlayContext) {
+        final screenWidth = MediaQuery.sizeOf(overlayContext).width;
+
+        return Positioned(
+          top: MediaQuery.paddingOf(overlayContext).top + 14,
+          left: 12,
+          right: 12,
+          child: SafeArea(
+            bottom: false,
+            child: Center(
+              child: ConstrainedBox(
+                constraints: BoxConstraints(
+                  maxWidth: screenWidth >= 700 ? 560 : 520,
+                ),
+                child: Material(
+                  elevation: 12,
+                  borderRadius: BorderRadius.circular(16),
+                  clipBehavior: Clip.antiAlias,
+                  child: Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.fromLTRB(16, 14, 16, 14),
+                    decoration: BoxDecoration(
+                      border: Border.all(color: AppColors.danger, width: 1.5),
+                      borderRadius: BorderRadius.circular(16),
+                    ),
+                    child: Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Icon(
+                          Icons.warning_rounded,
+                          color: AppColors.danger,
+                          size: 28,
+                        ),
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Text(
+                                title,
+                                style: const TextStyle(
+                                  fontWeight: FontWeight.w900,
+                                  fontSize: 16,
+                                  color: AppColors.danger,
+                                ),
+                              ),
+                              const SizedBox(height: 6),
+                              Text(
+                                message,
+                                maxLines: 4,
+                                overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(
+                                  fontWeight: FontWeight.w600,
+                                  fontSize: 13,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        );
+      },
+    );
+
+    final overlay = Overlay.maybeOf(context);
+    if (overlay == null) return;
+
+    _scanPopupEntry = entry;
+    overlay.insert(entry);
+
+    // All scan warnings stay visible for 4 seconds.
+    _scanPopupTimer = Timer(const Duration(seconds: 4), () {
       if (identical(_scanPopupEntry, entry)) {
         entry.remove();
         _scanPopupEntry = null;
@@ -680,6 +846,7 @@ class _ScanCoilScreenState extends State<ScanCoilScreen>
 
     setState(() {
       _sessionCoils.clear();
+      _inFlightCoils.clear();
       _queue.clear();
       _recent.clear();
       _localSequence = 0;
@@ -894,6 +1061,7 @@ class _ScanCoilScreenState extends State<ScanCoilScreen>
       _locationId = value;
       _lineId = null;
       _sessionCoils.clear();
+      _inFlightCoils.clear();
       _queue.clear();
       _recent.clear();
       _localSequence = 0;
@@ -914,6 +1082,7 @@ class _ScanCoilScreenState extends State<ScanCoilScreen>
     setState(() {
       _lineId = value;
       _sessionCoils.clear();
+      _inFlightCoils.clear();
       _queue.clear();
       _recent.clear();
       _localSequence = 0;

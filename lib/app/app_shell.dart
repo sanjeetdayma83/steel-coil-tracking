@@ -115,7 +115,7 @@ class _AppShellState extends State<AppShell> {
           }
 
           return Scaffold(
-            body: _content(),
+            body: SafeArea(bottom: false, child: _content()),
             bottomNavigationBar: NavigationBar(
               selectedIndex: _selectedIndex,
               onDestinationSelected: _select,

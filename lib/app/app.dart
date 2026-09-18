@@ -10,7 +10,7 @@ class SteelCoilTrackingApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Steel Coil Tracking',
+      title: 'CoilTrack',
       debugShowCheckedModeBanner: false,
       theme: AppTheme.light(),
       initialRoute: AppRoutes.home,

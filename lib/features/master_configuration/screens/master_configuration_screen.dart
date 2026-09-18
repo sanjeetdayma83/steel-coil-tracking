@@ -35,7 +35,6 @@ class _MasterConfigurationScreenState extends State<MasterConfigurationScreen> {
 
     try {
       final db = SupabaseService.client;
-
       final results = await Future.wait([
         db.from('app_locations').select().order('name'),
         db.from('app_machines').select().order('code'),
@@ -46,7 +45,6 @@ class _MasterConfigurationScreenState extends State<MasterConfigurationScreen> {
       ]);
 
       if (!mounted) return;
-
       setState(() {
         _locations = List<Map<String, dynamic>>.from(results[0]);
         _machines = List<Map<String, dynamic>>.from(results[1]);
@@ -63,7 +61,7 @@ class _MasterConfigurationScreenState extends State<MasterConfigurationScreen> {
   }
 
   Future<void> _addLocation() async {
-    await _showSimpleCreateDialog(
+    await _showCreateOrEditDialog(
       title: 'Add Location',
       codeLabel: 'Location Code',
       nameLabel: 'Location Name',
@@ -81,7 +79,7 @@ class _MasterConfigurationScreenState extends State<MasterConfigurationScreen> {
   }
 
   Future<void> _addMachine() async {
-    await _showSimpleCreateDialog(
+    await _showCreateOrEditDialog(
       title: 'Add Machine',
       codeLabel: 'Machine Code',
       nameLabel: 'Machine Name',
@@ -140,9 +138,8 @@ class _MasterConfigurationScreenState extends State<MasterConfigurationScreen> {
                                 child: Text('${location['name']}'),
                               ),
                         ],
-                        onChanged: (value) => setDialogState(() {
-                          locationId = value;
-                        }),
+                        onChanged: (value) =>
+                            setDialogState(() => locationId = value),
                       ),
                     ],
                   ),
@@ -156,7 +153,6 @@ class _MasterConfigurationScreenState extends State<MasterConfigurationScreen> {
                     onPressed: () async {
                       final code = codeController.text.trim();
                       final name = nameController.text.trim();
-
                       if (code.isEmpty || name.isEmpty) return;
 
                       try {
@@ -166,7 +162,6 @@ class _MasterConfigurationScreenState extends State<MasterConfigurationScreen> {
                           'location_id': locationId,
                           'active': true,
                         });
-
                         if (!dialogContext.mounted) return;
                         Navigator.of(dialogContext).pop();
                       } catch (error) {
@@ -191,22 +186,233 @@ class _MasterConfigurationScreenState extends State<MasterConfigurationScreen> {
       codeController.dispose();
       nameController.dispose();
     }
-
     await _loadAll();
   }
 
-  Future<void> _showSimpleCreateDialog({
+  Future<void> _editLocation(Map<String, dynamic> item) async {
+    await _showCreateOrEditDialog(
+      title: 'Edit Location',
+      codeLabel: 'Location Code',
+      nameLabel: 'Location Name',
+      extraLabel: 'Type',
+      extraHint: 'area / storage / process',
+      initialCode: '${item['code'] ?? ''}',
+      initialName: '${item['name'] ?? ''}',
+      initialExtra: '${item['location_type'] ?? 'area'}',
+      onSave: (code, name, extra) async {
+        await SupabaseService.client
+            .from('app_locations')
+            .update({
+              'code': code,
+              'name': name,
+              'location_type': extra.isEmpty ? 'area' : extra,
+              'updated_at': DateTime.now().toUtc().toIso8601String(),
+            })
+            .eq('id', item['id']);
+      },
+    );
+  }
+
+  Future<void> _editMachine(Map<String, dynamic> item) async {
+    await _showCreateOrEditDialog(
+      title: 'Edit Machine',
+      codeLabel: 'Machine Code',
+      nameLabel: 'Machine Name',
+      initialCode: '${item['code'] ?? ''}',
+      initialName: '${item['name'] ?? ''}',
+      onSave: (code, name, extra) async {
+        await SupabaseService.client
+            .from('app_machines')
+            .update({
+              'code': code,
+              'name': name,
+              'updated_at': DateTime.now().toUtc().toIso8601String(),
+            })
+            .eq('id', item['id']);
+      },
+    );
+  }
+
+  Future<void> _editLine(Map<String, dynamic> item) async {
+    final codeController = TextEditingController(text: '${item['code'] ?? ''}');
+    final nameController = TextEditingController(text: '${item['name'] ?? ''}');
+    String? locationId = item['location_id'] as String?;
+
+    try {
+      await showDialog<void>(
+        context: context,
+        builder: (dialogContext) {
+          return StatefulBuilder(
+            builder: (dialogContext, setDialogState) {
+              return AlertDialog(
+                title: const Text('Edit Line'),
+                content: SizedBox(
+                  width: 420,
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      TextField(
+                        controller: codeController,
+                        decoration: const InputDecoration(
+                          labelText: 'Line Code',
+                        ),
+                      ),
+                      const SizedBox(height: 12),
+                      TextField(
+                        controller: nameController,
+                        decoration: const InputDecoration(
+                          labelText: 'Line Name',
+                        ),
+                      ),
+                      const SizedBox(height: 12),
+                      DropdownButtonFormField<String>(
+                        initialValue: locationId,
+                        decoration: const InputDecoration(
+                          labelText: 'Location',
+                        ),
+                        items: [
+                          for (final location in _locations)
+                            if (location['active'] == true)
+                              DropdownMenuItem<String>(
+                                value: location['id'] as String,
+                                child: Text('${location['name']}'),
+                              ),
+                        ],
+                        onChanged: (value) =>
+                            setDialogState(() => locationId = value),
+                      ),
+                    ],
+                  ),
+                ),
+                actions: [
+                  TextButton(
+                    onPressed: () => Navigator.of(dialogContext).pop(),
+                    child: const Text('Cancel'),
+                  ),
+                  FilledButton(
+                    onPressed: () async {
+                      final code = codeController.text.trim();
+                      final name = nameController.text.trim();
+                      if (code.isEmpty || name.isEmpty) return;
+
+                      try {
+                        await SupabaseService.client
+                            .from('app_lines')
+                            .update({
+                              'code': code,
+                              'name': name,
+                              'location_id': locationId,
+                              'updated_at': DateTime.now()
+                                  .toUtc()
+                                  .toIso8601String(),
+                            })
+                            .eq('id', item['id']);
+                        if (!dialogContext.mounted) return;
+                        Navigator.of(dialogContext).pop();
+                      } catch (error) {
+                        if (!dialogContext.mounted) return;
+                        ScaffoldMessenger.of(dialogContext).showSnackBar(
+                          SnackBar(
+                            content: Text('Could not update line: $error'),
+                            backgroundColor: AppColors.danger,
+                          ),
+                        );
+                      }
+                    },
+                    child: const Text('Save'),
+                  ),
+                ],
+              );
+            },
+          );
+        },
+      );
+    } finally {
+      codeController.dispose();
+      nameController.dispose();
+    }
+    await _loadAll();
+  }
+
+  Future<void> _deleteItem({
+    required String table,
+    required String id,
+    required String label,
+  }) async {
+    final confirm = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Delete?'),
+        content: Text('Delete "$label"? This cannot be undone.'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            style: FilledButton.styleFrom(backgroundColor: AppColors.danger),
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Delete'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirm != true) return;
+
+    try {
+      await SupabaseService.client.from(table).delete().eq('id', id);
+      await _loadAll();
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('"$label" deleted')));
+    } catch (error) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            'Delete failed. Maybe this item is used in scans.\n$error',
+          ),
+          backgroundColor: AppColors.danger,
+        ),
+      );
+    }
+  }
+
+  Future<void> _toggle(String table, String id, bool active) async {
+    try {
+      await SupabaseService.client
+          .from(table)
+          .update({'active': !active})
+          .eq('id', id);
+      await _loadAll();
+    } catch (error) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Update failed: $error'),
+          backgroundColor: AppColors.danger,
+        ),
+      );
+    }
+  }
+
+  Future<void> _showCreateOrEditDialog({
     required String title,
     required String codeLabel,
     required String nameLabel,
     String? extraLabel,
     String? extraHint,
+    String initialCode = '',
+    String initialName = '',
+    String initialExtra = '',
     required Future<void> Function(String code, String name, String extra)
     onSave,
   }) async {
-    final codeController = TextEditingController();
-    final nameController = TextEditingController();
-    final extraController = TextEditingController();
+    final codeController = TextEditingController(text: initialCode);
+    final nameController = TextEditingController(text: initialName);
+    final extraController = TextEditingController(text: initialExtra);
 
     try {
       await showDialog<void>(
@@ -251,12 +457,10 @@ class _MasterConfigurationScreenState extends State<MasterConfigurationScreen> {
                   final code = codeController.text.trim();
                   final name = nameController.text.trim();
                   final extra = extraController.text.trim();
-
                   if (code.isEmpty || name.isEmpty) return;
 
                   try {
                     await onSave(code, name, extra);
-
                     if (!dialogContext.mounted) return;
                     Navigator.of(dialogContext).pop();
                   } catch (error) {
@@ -280,106 +484,93 @@ class _MasterConfigurationScreenState extends State<MasterConfigurationScreen> {
       nameController.dispose();
       extraController.dispose();
     }
-
     await _loadAll();
-  }
-
-  Future<void> _toggle(String table, String id, bool active) async {
-    try {
-      await SupabaseService.client
-          .from(table)
-          .update({'active': !active})
-          .eq('id', id);
-
-      await _loadAll();
-    } catch (error) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text('Update failed: $error'),
-          backgroundColor: AppColors.danger,
-        ),
-      );
-    }
   }
 
   @override
   Widget build(BuildContext context) {
-    return SingleChildScrollView(
-      padding: const EdgeInsets.all(20),
-      child: Center(
-        child: ConstrainedBox(
-          constraints: const BoxConstraints(maxWidth: 1150),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              const Text(
-                'Master Configuration',
-                style: AppTextStyles.pageTitle,
-              ),
-              const SizedBox(height: 8),
-              const Text(
-                'Locations, machines and lines are database-configured; the app does not hardcode plant masters.',
-                style: AppTextStyles.pageSubtitle,
-              ),
-              const SizedBox(height: 18),
-              Card(
-                child: Padding(
-                  padding: const EdgeInsets.all(8),
-                  child: Row(
-                    children: [
-                      for (final entry in [
-                        ('Locations', 0),
-                        ('Machines', 1),
-                        ('Lines', 2),
-                      ])
-                        Expanded(
-                          child: TextButton(
-                            onPressed: () => setState(() => _tab = entry.$2),
-                            child: Text(
-                              entry.$1,
-                              style: TextStyle(
-                                fontWeight: _tab == entry.$2
-                                    ? FontWeight.w800
-                                    : FontWeight.w500,
-                                color: _tab == entry.$2
-                                    ? AppColors.navy
-                                    : AppColors.textSecondary,
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final horizontal = constraints.maxWidth >= 700 ? 28.0 : 16.0;
+
+        return SingleChildScrollView(
+          padding: EdgeInsets.fromLTRB(horizontal, 20, horizontal, 32),
+          child: Center(
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 1150),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text(
+                    'Master Configuration',
+                    style: AppTextStyles.pageTitle,
+                  ),
+                  const SizedBox(height: 8),
+                  const Text(
+                    'Locations, machines and lines are database-configured. You can add, edit, activate/deactivate and delete.',
+                    style: AppTextStyles.pageSubtitle,
+                  ),
+                  const SizedBox(height: 18),
+                  Card(
+                    child: Padding(
+                      padding: const EdgeInsets.all(8),
+                      child: Row(
+                        children: [
+                          for (final entry in [
+                            ('Locations', 0),
+                            ('Machines', 1),
+                            ('Lines', 2),
+                          ])
+                            Expanded(
+                              child: TextButton(
+                                onPressed: () =>
+                                    setState(() => _tab = entry.$2),
+                                child: Text(
+                                  entry.$1,
+                                  style: TextStyle(
+                                    fontWeight: _tab == entry.$2
+                                        ? FontWeight.w800
+                                        : FontWeight.w500,
+                                    color: _tab == entry.$2
+                                        ? AppColors.navy
+                                        : AppColors.textSecondary,
+                                  ),
+                                ),
                               ),
                             ),
+                          IconButton(
+                            tooltip: 'Refresh',
+                            onPressed: _loading ? null : _loadAll,
+                            icon: const Icon(Icons.refresh_rounded),
                           ),
-                        ),
-                      IconButton(
-                        tooltip: 'Refresh',
-                        onPressed: _loading ? null : _loadAll,
-                        icon: const Icon(Icons.refresh_rounded),
+                        ],
                       ),
-                    ],
+                    ),
                   ),
-                ),
+                  const SizedBox(height: 16),
+                  if (_error != null)
+                    Padding(
+                      padding: const EdgeInsets.only(bottom: 12),
+                      child: Text(
+                        _error!,
+                        style: const TextStyle(color: AppColors.danger),
+                      ),
+                    ),
+                  if (_loading)
+                    const Card(
+                      child: Padding(
+                        padding: EdgeInsets.all(36),
+                        child: Center(child: CircularProgressIndicator()),
+                      ),
+                    )
+                  else
+                    _buildTab(),
+                ],
               ),
-              const SizedBox(height: 16),
-              if (_error != null)
-                Padding(
-                  padding: const EdgeInsets.only(bottom: 12),
-                  child: Text(
-                    _error!,
-                    style: const TextStyle(color: AppColors.danger),
-                  ),
-                ),
-              if (_loading)
-                const Card(
-                  child: Padding(
-                    padding: EdgeInsets.all(36),
-                    child: Center(child: CircularProgressIndicator()),
-                  ),
-                )
-              else
-                _buildTab(),
-            ],
+            ),
           ),
-        ),
-      ),
+        );
+      },
     );
   }
 
@@ -392,6 +583,12 @@ class _MasterConfigurationScreenState extends State<MasterConfigurationScreen> {
           icon: Icons.location_on_rounded,
           items: _locations,
           onAdd: _addLocation,
+          onEdit: _editLocation,
+          onDelete: (item) => _deleteItem(
+            table: 'app_locations',
+            id: item['id'] as String,
+            label: '${item['name']}',
+          ),
           onToggle: (item) => _toggle(
             'app_locations',
             item['id'] as String,
@@ -410,6 +607,12 @@ class _MasterConfigurationScreenState extends State<MasterConfigurationScreen> {
           icon: Icons.precision_manufacturing_rounded,
           items: _machines,
           onAdd: _addMachine,
+          onEdit: _editMachine,
+          onDelete: (item) => _deleteItem(
+            table: 'app_machines',
+            id: item['id'] as String,
+            label: '${item['name']}',
+          ),
           onToggle: (item) => _toggle(
             'app_machines',
             item['id'] as String,
@@ -425,6 +628,12 @@ class _MasterConfigurationScreenState extends State<MasterConfigurationScreen> {
           icon: Icons.route_rounded,
           items: _lines,
           onAdd: _addLine,
+          onEdit: _editLine,
+          onDelete: (item) => _deleteItem(
+            table: 'app_lines',
+            id: item['id'] as String,
+            label: '${item['name']}',
+          ),
           onToggle: (item) => _toggle(
             'app_lines',
             item['id'] as String,
@@ -436,7 +645,6 @@ class _MasterConfigurationScreenState extends State<MasterConfigurationScreen> {
             final locationName = location.isEmpty
                 ? '-'
                 : '${location.first['name']}';
-
             return ['${item['code']}', '${item['name']}', locationName];
           },
         );
@@ -449,6 +657,8 @@ class _MasterConfigurationScreenState extends State<MasterConfigurationScreen> {
     required IconData icon,
     required List<Map<String, dynamic>> items,
     required Future<void> Function() onAdd,
+    required Future<void> Function(Map<String, dynamic> item) onEdit,
+    required Future<void> Function(Map<String, dynamic> item) onDelete,
     required Future<void> Function(Map<String, dynamic> item) onToggle,
     required List<String> Function(Map<String, dynamic> item) columns,
   }) {
@@ -493,8 +703,8 @@ class _MasterConfigurationScreenState extends State<MasterConfigurationScreen> {
                   width: double.infinity,
                   margin: const EdgeInsets.only(bottom: 8),
                   padding: const EdgeInsets.symmetric(
-                    horizontal: 14,
-                    vertical: 12,
+                    horizontal: 12,
+                    vertical: 10,
                   ),
                   decoration: BoxDecoration(
                     color: AppColors.surfaceSoft,
@@ -517,6 +727,17 @@ class _MasterConfigurationScreenState extends State<MasterConfigurationScreen> {
                               ),
                           ],
                         ),
+                      ),
+                      IconButton(
+                        tooltip: 'Edit',
+                        icon: const Icon(Icons.edit_outlined, size: 20),
+                        onPressed: () => onEdit(item),
+                      ),
+                      IconButton(
+                        tooltip: 'Delete',
+                        icon: const Icon(Icons.delete_outline, size: 20),
+                        color: AppColors.danger,
+                        onPressed: () => onDelete(item),
                       ),
                       Switch.adaptive(
                         value: active,
