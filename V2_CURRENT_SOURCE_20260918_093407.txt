@@ -1,0 +1,2603 @@
+﻿==============================
+STEEL COIL TRACKING V2
+CURRENT SOURCE AUDIT
+20260918_093407
+==============================
+
+===== PUBSPEC =====
+name: steel_coil_tracking
+description: "A new Flutter project."
+publish_to: 'none'
+version: 0.1.0+1
+
+environment:
+  sdk: ^3.12.2
+
+dependencies:
+  excel: 3.0.0
+  file_picker: 13.1.0
+  flutter:
+    sdk: flutter
+  mobile_scanner: 7.4.2
+  supabase_flutter: 2.17.2
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/config/
+
+
+
+==============================
+===== SCAN COIL SCREEN =====
+==============================
+import 'dart:async';
+
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:mobile_scanner/mobile_scanner.dart';
+
+import '../../../app/theme/app_colors.dart';
+import '../../../app/theme/app_text_styles.dart';
+import '../../../core/services/qr_parser_service.dart';
+import '../../../core/services/supabase_service.dart';
+
+class ScanCoilScreen extends StatefulWidget {
+  const ScanCoilScreen({super.key, this.isActive = true});
+
+  final bool isActive;
+
+  @override
+  State<ScanCoilScreen> createState() => _ScanCoilScreenState();
+}
+
+class _ScanViewItem {
+  _ScanViewItem({
+    required this.coilNo,
+    required this.thickness,
+    required this.width,
+    required this.localSequence,
+  });
+
+  final String coilNo;
+  final double thickness;
+  final double width;
+  final int localSequence;
+
+  int? serverSequence;
+  bool saved = false;
+  String? error;
+}
+
+class _ScanCoilScreenState extends State<ScanCoilScreen>
+    with WidgetsBindingObserver {
+  late final MobileScannerController _camera;
+  late final TextEditingController _operatorController;
+
+  final _parser = const QrParserService();
+  final Set<String> _sessionCoils = <String>{};
+  final List<Map<String, dynamic>> _queue = <Map<String, dynamic>>[];
+  final List<_ScanViewItem> _recent = <_ScanViewItem>[];
+
+  List<Map<String, dynamic>> _locations = const [];
+  List<Map<String, dynamic>> _lines = const [];
+
+  String? _locationId;
+  String? _lineId;
+  String? _sessionId;
+  String? _lastCoil;
+  String? _error;
+
+  bool _cameraRequested = false;
+  bool _workerRunning = false;
+  OverlayEntry? _scanPopupEntry;
+  Timer? _scanPopupTimer;
+  Future<void>? _drainFuture;
+  int _localSequence = 0;
+
+  bool get _canScan =>
+      _locationId != null &&
+      _lineId != null &&
+      _operatorController.text.trim().isNotEmpty;
+
+  bool get _isRunning => _camera.value.isRunning;
+
+  @override
+  void initState() {
+    super.initState();
+
+    WidgetsBinding.instance.addObserver(this);
+
+    _camera = MobileScannerController(
+      autoStart: false,
+      detectionSpeed: DetectionSpeed.noDuplicates,
+      formats: const [BarcodeFormat.qrCode],
+    );
+
+    _operatorController = TextEditingController(text: 'Operator');
+
+    _loadMasters();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.inactive ||
+        state == AppLifecycleState.paused ||
+        state == AppLifecycleState.hidden) {
+      unawaited(_stopCamera(updateUi: true));
+    }
+
+    if (state == AppLifecycleState.resumed && widget.isActive && _canScan) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) unawaited(_startCamera());
+      });
+    }
+  }
+
+  Future<void> _loadMasters() async {
+    try {
+      final db = SupabaseService.client;
+
+      final results = await Future.wait([
+        db
+            .from('app_locations')
+            .select('id,code,name,location_type')
+            .eq('active', true)
+            .order('name'),
+        db
+            .from('app_lines')
+            .select('id,code,name,location_id')
+            .eq('active', true)
+            .order('name'),
+      ]);
+
+      if (!mounted) return;
+
+      final locations = List<Map<String, dynamic>>.from(results[0] as List);
+      final lines = List<Map<String, dynamic>>.from(results[1] as List);
+
+      setState(() {
+        _locations = locations;
+        _lines = lines;
+
+        if (_locationId == null && locations.isNotEmpty) {
+          _locationId = locations.first['id'] as String;
+        }
+
+        if (_lineId != null &&
+            !_visibleLines.any((line) => line['id'] == _lineId)) {
+          _lineId = null;
+        }
+      });
+
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted && _canScan) {
+          unawaited(_startCamera());
+        }
+      });
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _error = 'Master data load failed: $error';
+      });
+    }
+  }
+
+  List<Map<String, dynamic>> get _visibleLines {
+    if (_locationId == null) return _lines;
+
+    return _lines.where((line) {
+      final locationId = line['location_id'] as String?;
+      return locationId == null || locationId == _locationId;
+    }).toList();
+  }
+
+  Future<void> _startCamera() async {
+    if (!widget.isActive || !_canScan || _cameraRequested || _isRunning) return;
+
+    _cameraRequested = true;
+
+    try {
+      await _camera.start();
+
+      if (!mounted) return;
+
+      setState(() {
+        _error = null;
+      });
+    } catch (error) {
+      if (!mounted) return;
+
+      setState(() {
+        _error = 'Camera could not start: $error';
+      });
+    } finally {
+      _cameraRequested = false;
+    }
+  }
+
+  Future<void> _stopCamera({bool updateUi = false}) async {
+    if (_cameraRequested) {
+      _cameraRequested = false;
+    }
+
+    if (!_isRunning) {
+      if (updateUi && mounted) setState(() {});
+      return;
+    }
+
+    try {
+      await _camera.stop();
+    } catch (_) {
+      // Ignore platform stop races.
+    }
+
+    if (updateUi && mounted) {
+      setState(() {});
+    }
+  }
+
+  Future<void> _closeSession() async {
+    final sessionId = _sessionId;
+    if (sessionId == null) return;
+    _sessionId = null;
+    try {
+      await SupabaseService.client
+          .from('scan_sessions')
+          .update({'ended_at': DateTime.now().toUtc().toIso8601String()})
+          .eq('id', sessionId);
+    } catch (_) {}
+  }
+
+  Future<void> _changeLocation(String? value) async {
+    if (value == _locationId) return;
+    await _drainQueue();
+    await _stopCamera();
+    await _closeSession();
+    if (!mounted) return;
+    setState(() {
+      _locationId = value;
+      _lineId = null;
+      _sessionCoils.clear();
+      _queue.clear();
+      _recent.clear();
+      _localSequence = 0;
+      _lastCoil = null;
+      _error = null;
+    });
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted && _canScan) unawaited(_startCamera());
+    });
+  }
+
+  Future<void> _changeLine(String? value) async {
+    if (value == _lineId) return;
+    await _drainQueue();
+    await _stopCamera();
+    await _closeSession();
+    if (!mounted) return;
+    setState(() {
+      _lineId = value;
+      _sessionCoils.clear();
+      _queue.clear();
+      _recent.clear();
+      _localSequence = 0;
+      _lastCoil = null;
+      _error = null;
+    });
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted && _canScan) unawaited(_startCamera());
+    });
+  }
+
+  Future<void> _ensureSession() async {
+    if (_sessionId != null) return;
+
+    final response = await SupabaseService.client
+        .from('scan_sessions')
+        .insert({
+          'location_id': _locationId,
+          'line_id': _lineId,
+          'operator_label': _operatorController.text.trim(),
+        })
+        .select('id')
+        .single();
+
+    _sessionId = response['id'] as String;
+  }
+
+  void _onDetect(BarcodeCapture capture) {
+    if (!_isRunning || !_canScan) return;
+
+    for (final barcode in capture.barcodes) {
+      final raw = barcode.rawValue?.trim();
+
+      if (raw == null || raw.isEmpty) continue;
+
+      _handleRawQr(raw);
+      break;
+    }
+  }
+
+  void _handleRawQr(String raw) {
+    CoilQrData parsed;
+
+    try {
+      parsed = _parser.parse(raw);
+    } catch (error) {
+      if (mounted) {
+        setState(() {
+          _error = 'Invalid QR: $error';
+        });
+      }
+      HapticFeedback.heavyImpact();
+      return;
+    }
+
+    final coilKey = parsed.coilNo.trim().toUpperCase();
+
+    if (coilKey.isEmpty || _sessionCoils.contains(coilKey)) {
+      return;
+    }
+
+    _sessionCoils.add(coilKey);
+
+    final localSequence = ++_localSequence;
+    final item = _ScanViewItem(
+      coilNo: parsed.coilNo,
+      thickness: parsed.thickness,
+      width: parsed.width,
+      localSequence: localSequence,
+    );
+
+    _queue.add({'coil': parsed, 'sequence': localSequence, 'item': item});
+
+    if (mounted) {
+      setState(() {
+        _lastCoil = parsed.coilNo;
+        _error = null;
+        _recent.insert(0, item);
+        if (_recent.length > 15) {
+          _recent.removeLast();
+        }
+      });
+    }
+
+    HapticFeedback.selectionClick();
+    unawaited(_drainQueue());
+  }
+
+  Future<void> _drainQueue() {
+    final active = _drainFuture;
+    if (active != null) return active;
+
+    final future = _drainQueueInternal();
+    _drainFuture = future;
+    unawaited(
+      future.whenComplete(() {
+        if (identical(_drainFuture, future)) {
+          _drainFuture = null;
+        }
+      }),
+    );
+    return future;
+  }
+
+  Future<void> _drainQueueInternal() async {
+    if (_workerRunning) return;
+    _workerRunning = true;
+
+    try {
+      while (_queue.isNotEmpty) {
+        final pending = _queue.removeAt(0);
+        final parsed = pending['coil'] as CoilQrData;
+        final item = pending['item'] as _ScanViewItem;
+
+        try {
+          await _ensureSession();
+
+          final sessionId = _sessionId;
+          final locationId = _locationId;
+          final lineId = _lineId;
+          if (sessionId == null || locationId == null || lineId == null) {
+            throw const FormatException('Scan session details are missing.');
+          }
+
+          Map<String, dynamic>? previousLocation;
+          try {
+            final previousRows = await SupabaseService.client
+                .from('v_current_coil_locations')
+                .select(
+                  'coil_no,location_id,line_id,location_name,line_name,scanned_at',
+                )
+                .eq('coil_no', parsed.coilNo)
+                .limit(1);
+            if (previousRows.isNotEmpty) {
+              previousLocation = Map<String, dynamic>.from(
+                previousRows.first as Map,
+              );
+            }
+          } catch (_) {
+            // A history lookup must never block saving a scan.
+          }
+
+          final result = await SupabaseService.client.rpc(
+            'record_coil_scan',
+            params: {
+              'p_session_id': sessionId,
+              'p_coil_no': parsed.coilNo,
+              'p_material_code': parsed.materialCode,
+              'p_thickness': parsed.thickness,
+              'p_width': parsed.width,
+              'p_location_id': locationId,
+              'p_line_id': lineId,
+              'p_operator_label': _operatorController.text.trim(),
+            },
+          );
+
+          final rows = result as List;
+          if (rows.isEmpty) {
+            throw const FormatException(
+              'Database did not return a scan result.',
+            );
+          }
+
+          final row = Map<String, dynamic>.from(rows.first as Map);
+          final duplicate = row['is_duplicate'] == true;
+          final sequence = (row['sequence_no'] as num?)?.toInt();
+
+          if (!mounted) continue;
+
+          setState(() {
+            item.serverSequence = sequence;
+            item.saved = true;
+            item.error = duplicate ? 'Duplicate in current session' : null;
+          });
+
+          HapticFeedback.mediumImpact();
+
+          List<String> machines = const [];
+          try {
+            machines = await _plannedMachinesForCoil(parsed.coilNo);
+          } catch (_) {
+            // Keep camera UX clean. The scan is already persisted.
+          }
+
+          if (mounted) {
+            // Non-blocking result banner: the camera/scan queue continues
+            // immediately while the result remains visible for 2 seconds.
+            _showScanResultPopup(
+              coilNo: parsed.coilNo,
+              thickness: parsed.thickness,
+              width: parsed.width,
+              machines: machines,
+              previousLocation: previousLocation,
+            );
+          }
+        } catch (error) {
+          if (!mounted) continue;
+          setState(() {
+            item.error = _friendlyDatabaseError(error);
+          });
+        }
+      }
+    } finally {
+      _workerRunning = false;
+    }
+  }
+
+  bool _ppcRowMatchesCoilNo(Map<String, dynamic> row, String coilNo) {
+    final needle = coilNo.trim().toUpperCase();
+    final mother = '${row['mother_coil'] ?? ''}'.trim().toUpperCase();
+    final slit = '${row['slit_id'] ?? ''}'.trim().toUpperCase();
+    final candidates = <String>{
+      if (mother.isNotEmpty) mother,
+      if (slit.isNotEmpty) slit,
+      if (mother.isNotEmpty && slit.isNotEmpty) '$mother$slit',
+      if (mother.isNotEmpty && slit.isNotEmpty) '$mother-$slit',
+      if (mother.isNotEmpty && slit.isNotEmpty) '$mother/$slit',
+    };
+    return needle.isNotEmpty &&
+        candidates.any((candidate) => candidate.contains(needle));
+  }
+
+  Future<List<String>> _plannedMachinesForCoil(String coilNo) async {
+    final plans = await SupabaseService.client
+        .from('ppc_plans')
+        .select('id')
+        .eq('is_active', true)
+        .order('imported_at', ascending: false)
+        .limit(1);
+    if (plans.isEmpty) return const [];
+
+    final planId = plans.first['id'] as String;
+    final rows = await SupabaseService.client
+        .from('ppc_plan_rows')
+        .select('planned_machine_code,mother_coil,slit_id')
+        .eq('plan_id', planId)
+        .limit(5000);
+
+    return List<Map<String, dynamic>>.from(rows)
+        .where((row) => _ppcRowMatchesCoilNo(row, coilNo))
+        .map((row) => '${row['planned_machine_code'] ?? ''}'.trim())
+        .where((code) => code.isNotEmpty)
+        .toSet()
+        .toList()
+      ..sort();
+  }
+
+  void _showScanResultPopup({
+    required String coilNo,
+    required double thickness,
+    required double width,
+    required List<String> machines,
+    Map<String, dynamic>? previousLocation,
+  }) {
+    if (!mounted) return;
+
+    String locationName = '-';
+    String lineName = '-';
+
+    for (final row in _locations) {
+      if (row['id'] == _locationId) {
+        locationName = '${row['name'] ?? row['code'] ?? '-'}';
+        break;
+      }
+    }
+    for (final row in _lines) {
+      if (row['id'] == _lineId) {
+        lineName = '${row['name'] ?? row['code'] ?? '-'}';
+        break;
+      }
+    }
+
+    _scanPopupTimer?.cancel();
+    _scanPopupEntry?.remove();
+
+    final planned = machines.isNotEmpty;
+    final locationUpdated =
+        previousLocation != null &&
+        (previousLocation['location_id'] != _locationId ||
+            previousLocation['line_id'] != _lineId);
+    final locationStatus = locationUpdated
+        ? 'LOCATION UPDATED'
+        : 'LOCATION AVAILABLE';
+    final entry = OverlayEntry(
+      builder: (overlayContext) {
+        final width = MediaQuery.sizeOf(overlayContext).width;
+        return Positioned(
+          top: MediaQuery.paddingOf(overlayContext).top + 14,
+          left: 12,
+          right: 12,
+          child: SafeArea(
+            bottom: false,
+            child: Center(
+              child: ConstrainedBox(
+                constraints: BoxConstraints(maxWidth: width >= 700 ? 560 : 520),
+                child: Material(
+                  elevation: 12,
+                  borderRadius: BorderRadius.circular(16),
+                  clipBehavior: Clip.antiAlias,
+                  child: Container(
+                    padding: const EdgeInsets.fromLTRB(16, 14, 12, 14),
+                    decoration: BoxDecoration(
+                      border: Border.all(
+                        color: planned ? AppColors.success : AppColors.warning,
+                      ),
+                      borderRadius: BorderRadius.circular(16),
+                    ),
+                    child: Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Icon(
+                          planned
+                              ? Icons.check_circle_rounded
+                              : Icons.info_rounded,
+                          color: planned
+                              ? AppColors.success
+                              : AppColors.warning,
+                          size: 28,
+                        ),
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Text(
+                                planned ? 'PLANNED' : 'NOT PLANNED',
+                                style: const TextStyle(
+                                  fontWeight: FontWeight.w800,
+                                  fontSize: 16,
+                                ),
+                              ),
+                              const SizedBox(height: 3),
+                              Text(
+                                coilNo,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: AppTextStyles.sectionTitle,
+                              ),
+                              const SizedBox(height: 6),
+                              Text(
+                                planned
+                                    ? 'Machine: ${machines.join(', ')}'
+                                    : 'Machine: Not planned',
+                                maxLines: 3,
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                              Text(
+                                locationStatus,
+                                style: TextStyle(
+                                  fontWeight: FontWeight.w800,
+                                  fontSize: 12,
+                                  color: locationUpdated
+                                      ? AppColors.success
+                                      : AppColors.textSecondary,
+                                ),
+                              ),
+                              if (locationUpdated)
+                                Text(
+                                  'Previous: ${previousLocation['location_name'] ?? '-'} • ${previousLocation['line_name'] ?? '-'}',
+                                  maxLines: 2,
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                              Text(
+                                'Actual Location: $locationName • Line: $lineName',
+                                maxLines: 2,
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                              Text('Size: $thickness × $width'),
+                            ],
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        );
+      },
+    );
+
+    final overlay = Overlay.maybeOf(context);
+    if (overlay == null) return;
+
+    _scanPopupEntry = entry;
+    overlay.insert(entry);
+    _scanPopupTimer = Timer(const Duration(seconds: 2), () {
+      if (identical(_scanPopupEntry, entry)) {
+        entry.remove();
+        _scanPopupEntry = null;
+      }
+    });
+  }
+
+  String _friendlyDatabaseError(Object error) {
+    final message = error.toString().toLowerCase();
+
+    if (message.contains('socket') ||
+        message.contains('network') ||
+        message.contains('connection') ||
+        message.contains('timeout')) {
+      return 'Network unavailable. Please check your connection.';
+    }
+
+    if (message.contains('permission') ||
+        message.contains('rls') ||
+        message.contains('row-level security')) {
+      return 'Scan could not be saved because database permission was denied.';
+    }
+
+    if (message.contains('record_coil_scan') ||
+        message.contains('function') ||
+        message.contains('postgrest')) {
+      return 'Scan could not be saved. Please try again.';
+    }
+
+    return 'Scan could not be saved. Please try again.';
+  }
+
+  Future<void> _newSession() async {
+    await _drainQueue();
+    await _stopCamera();
+    await _closeSession();
+
+    if (!mounted) return;
+
+    setState(() {
+      _sessionCoils.clear();
+      _queue.clear();
+      _recent.clear();
+      _localSequence = 0;
+      _lastCoil = null;
+      _error = null;
+    });
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted && widget.isActive) unawaited(_startCamera());
+    });
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _scanPopupTimer?.cancel();
+    _scanPopupEntry?.remove();
+    _scanPopupEntry = null;
+    _operatorController.dispose();
+    unawaited(_camera.dispose());
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final wide = constraints.maxWidth >= 900;
+        final padding = constraints.maxWidth >= 700 ? 28.0 : 16.0;
+
+        return SingleChildScrollView(
+          padding: EdgeInsets.fromLTRB(padding, 20, padding, 32),
+          child: Center(
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 1200),
+              child: wide
+                  ? Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Expanded(flex: 7, child: _scannerCard()),
+                        const SizedBox(width: 18),
+                        Expanded(flex: 4, child: _controlPanel()),
+                      ],
+                    )
+                  : Column(
+                      children: [
+                        _scannerCard(),
+                        const SizedBox(height: 16),
+                        _controlPanel(),
+                      ],
+                    ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _scannerCard() {
+    final running = _isRunning;
+
+    return Card(
+      clipBehavior: Clip.antiAlias,
+      child: Column(
+        children: [
+          Padding(
+            padding: const EdgeInsets.all(18),
+            child: Row(
+              children: [
+                const Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        'Continuous QR Scanner',
+                        style: AppTextStyles.sectionTitle,
+                      ),
+                      SizedBox(height: 4),
+                      Text(
+                        'Scan coil after coil. No confirmation between scans.',
+                        style: AppTextStyles.pageSubtitle,
+                      ),
+                    ],
+                  ),
+                ),
+                _StatusChip(active: running),
+              ],
+            ),
+          ),
+          AspectRatio(
+            aspectRatio: 4 / 3,
+            child: Stack(
+              fit: StackFit.expand,
+              children: [
+                // The scanner widget stays mounted even while paused.
+                // This prevents controllerNotAttached start races.
+                MobileScanner(controller: _camera, onDetect: _onDetect),
+                IgnorePointer(
+                  child: Center(
+                    child: Container(
+                      width: 250,
+                      height: 175,
+                      decoration: BoxDecoration(
+                        border: Border.all(color: Colors.white, width: 2),
+                        borderRadius: BorderRadius.circular(18),
+                      ),
+                    ),
+                  ),
+                ),
+                Positioned(
+                  left: 16,
+                  right: 16,
+                  bottom: 16,
+                  child: LayoutBuilder(
+                    builder: (context, constraints) {
+                      final compact = constraints.maxWidth < 430;
+                      final buttonWidth = compact
+                          ? (constraints.maxWidth - 10) / 2
+                          : (constraints.maxWidth - 20) / 3;
+                      return Wrap(
+                        spacing: 10,
+                        runSpacing: 10,
+                        children: [
+                          SizedBox(
+                            width: buttonWidth,
+                            child: _CameraButton(
+                              icon: running
+                                  ? Icons.pause_rounded
+                                  : Icons.play_arrow_rounded,
+                              label: running ? 'Pause' : 'Start',
+                              onTap: running
+                                  ? () => _stopCamera(updateUi: true)
+                                  : _startCamera,
+                            ),
+                          ),
+                          SizedBox(
+                            width: buttonWidth,
+                            child: _CameraButton(
+                              icon: Icons.flash_on_rounded,
+                              label: 'Torch',
+                              onTap: () async {
+                                if (_isRunning) {
+                                  await _camera.toggleTorch();
+                                }
+                              },
+                            ),
+                          ),
+                          SizedBox(
+                            width: buttonWidth,
+                            child: _CameraButton(
+                              icon: Icons.flip_camera_android_rounded,
+                              label: 'Camera',
+                              onTap: () async {
+                                if (_isRunning) {
+                                  await _camera.switchCamera();
+                                }
+                              },
+                            ),
+                          ),
+                        ],
+                      );
+                    },
+                  ),
+                ),
+              ],
+            ),
+          ),
+          Padding(
+            padding: const EdgeInsets.all(16),
+            child: Row(
+              children: [
+                Icon(
+                  running
+                      ? Icons.speed_rounded
+                      : Icons.pause_circle_outline_rounded,
+                  size: 18,
+                  color: running ? AppColors.success : AppColors.textSecondary,
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    _canScan
+                        ? running
+                              ? 'Scanner is ready. Move directly to the next coil.'
+                              : 'Scanner paused. Press Start to continue.'
+                        : 'Choose Location and Line before scanning.',
+                    style: AppTextStyles.cardLabel,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _controlPanel() {
+    final visibleLines = _visibleLines;
+
+    return Column(
+      children: [
+        _selector(
+          title: 'Actual Location',
+          icon: Icons.location_on_rounded,
+          value: _locationId,
+          items: _locations,
+          labelBuilder: (item) => '${item['name']}',
+          onChanged: _changeLocation,
+        ),
+        const SizedBox(height: 12),
+        _selector(
+          title: 'Actual Line',
+          icon: Icons.route_rounded,
+          value: _lineId,
+          items: visibleLines,
+          labelBuilder: (item) => '${item['name']}',
+          onChanged: _changeLine,
+        ),
+        const SizedBox(height: 12),
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(18),
+            child: TextField(
+              controller: _operatorController,
+              textInputAction: TextInputAction.done,
+              decoration: const InputDecoration(
+                labelText: 'Operator / Incharge',
+                prefixIcon: Icon(Icons.person_outline_rounded),
+              ),
+              onChanged: (_) {
+                if (mounted) setState(() {});
+              },
+            ),
+          ),
+        ),
+        if (_error != null) ...[
+          const SizedBox(height: 12),
+          _ErrorCard(message: _error!),
+        ],
+        const SizedBox(height: 12),
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(20),
+            child: Column(
+              children: [
+                Row(
+                  children: [
+                    const Expanded(
+                      child: Text(
+                        'Session Scans',
+                        style: AppTextStyles.cardLabel,
+                      ),
+                    ),
+                    Text(
+                      '${_sessionCoils.length}',
+                      style: AppTextStyles.cardValue.copyWith(fontSize: 22),
+                    ),
+                  ],
+                ),
+                const Divider(height: 28),
+                Row(
+                  children: [
+                    const Icon(Icons.qr_code_rounded, color: AppColors.navy),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: Text(
+                        _lastCoil ?? 'No coil scanned yet',
+                        style: AppTextStyles.sectionTitle,
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        ),
+        const SizedBox(height: 12),
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(18),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text('Recent Scans', style: AppTextStyles.sectionTitle),
+                const SizedBox(height: 12),
+                if (_recent.isEmpty)
+                  const Text(
+                    'No scans in this session.',
+                    style: AppTextStyles.pageSubtitle,
+                  )
+                else
+                  ..._recent.map(_recentTile),
+              ],
+            ),
+          ),
+        ),
+        const SizedBox(height: 12),
+        SizedBox(
+          width: double.infinity,
+          child: OutlinedButton.icon(
+            onPressed: _sessionCoils.isEmpty ? null : _newSession,
+            icon: const Icon(Icons.restart_alt_rounded),
+            label: const Text('Start New Scan Session'),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _selector({
+    required String title,
+    required IconData icon,
+    required String? value,
+    required List<Map<String, dynamic>> items,
+    required String Function(Map<String, dynamic>) labelBuilder,
+    required ValueChanged<String?> onChanged,
+  }) {
+    final safeValue = items.any((item) => item['id'] == value) ? value : null;
+
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(14),
+        child: DropdownButtonFormField<String>(
+          initialValue: safeValue,
+          decoration: InputDecoration(labelText: title, prefixIcon: Icon(icon)),
+          items: [
+            for (final item in items)
+              DropdownMenuItem<String>(
+                value: item['id'] as String,
+                child: Text(
+                  labelBuilder(item),
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+          ],
+          onChanged: onChanged,
+        ),
+      ),
+    );
+  }
+
+  Widget _recentTile(_ScanViewItem item) {
+    final color = item.error != null
+        ? AppColors.danger
+        : item.saved
+        ? AppColors.success
+        : AppColors.warning;
+
+    return Container(
+      width: double.infinity,
+      margin: const EdgeInsets.only(bottom: 8),
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: AppColors.surfaceSoft,
+        borderRadius: BorderRadius.circular(10),
+      ),
+      child: Row(
+        children: [
+          Container(
+            width: 32,
+            height: 32,
+            alignment: Alignment.center,
+            decoration: BoxDecoration(
+              color: color.withValues(alpha: .12),
+              shape: BoxShape.circle,
+            ),
+            child: Text(
+              item.serverSequence?.toString() ?? item.localSequence.toString(),
+              style: TextStyle(
+                fontSize: 10,
+                fontWeight: FontWeight.w800,
+                color: color,
+              ),
+            ),
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  item.coilNo,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                    fontSize: 13,
+                    fontWeight: FontWeight.w700,
+                    color: AppColors.textPrimary,
+                  ),
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  '${item.thickness} × ${item.width}',
+                  style: AppTextStyles.cardLabel,
+                ),
+                if (item.error != null)
+                  Text(
+                    item.error!,
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      fontSize: 11,
+                      color: AppColors.danger,
+                    ),
+                  ),
+              ],
+            ),
+          ),
+          Icon(
+            item.error != null
+                ? Icons.error_outline_rounded
+                : item.saved
+                ? Icons.check_circle_rounded
+                : Icons.sync_rounded,
+            color: color,
+            size: 18,
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _StatusChip extends StatelessWidget {
+  const _StatusChip({required this.active});
+
+  final bool active;
+
+  @override
+  Widget build(BuildContext context) {
+    final color = active ? AppColors.success : AppColors.textSecondary;
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: .10),
+        borderRadius: BorderRadius.circular(20),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(Icons.circle, size: 8, color: color),
+          const SizedBox(width: 6),
+          Text(
+            active ? 'Scanning' : 'Paused',
+            style: TextStyle(
+              fontSize: 12,
+              fontWeight: FontWeight.w700,
+              color: color,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _ErrorCard extends StatelessWidget {
+  const _ErrorCard({required this.message});
+
+  final String message;
+
+  @override
+  Widget build(BuildContext context) {
+    return Card(
+      color: AppColors.danger.withValues(alpha: .06),
+      child: Padding(
+        padding: const EdgeInsets.all(14),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Icon(Icons.error_outline_rounded, color: AppColors.danger),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Text(
+                message,
+                style: const TextStyle(color: AppColors.danger, fontSize: 12),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _CameraButton extends StatelessWidget {
+  const _CameraButton({
+    required this.icon,
+    required this.label,
+    required this.onTap,
+  });
+
+  final IconData icon;
+  final String label;
+  final Future<void> Function() onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: Colors.black54,
+      borderRadius: BorderRadius.circular(12),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(12),
+        onTap: onTap,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(vertical: 11, horizontal: 8),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(icon, color: Colors.white, size: 19),
+              const SizedBox(width: 7),
+              Text(
+                label,
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+
+==============================
+===== CHECK LOCATION SCREEN =====
+==============================
+import 'dart:async';
+
+import 'package:flutter/material.dart';
+
+import '../../../app/theme/app_colors.dart';
+import '../../../app/theme/app_text_styles.dart';
+import '../../../core/services/supabase_service.dart';
+
+class CheckLocationScreen extends StatefulWidget {
+  const CheckLocationScreen({super.key});
+
+  @override
+  State<CheckLocationScreen> createState() => _CheckLocationScreenState();
+}
+
+class _CheckLocationScreenState extends State<CheckLocationScreen> {
+  final _searchController = TextEditingController();
+
+  List<Map<String, dynamic>> _machines = const [];
+  List<Map<String, dynamic>> _planRows = const [];
+  List<Map<String, dynamic>> _recentLocations = const [];
+  List<Map<String, dynamic>> _searchResults = const [];
+  Map<String, dynamic>? _selectedCoil;
+
+  String? _selectedMachine;
+  String? _error;
+  bool _loading = false;
+  bool _searching = false;
+  Timer? _searchDebounce;
+  int _searchToken = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadMachines();
+    _loadRecentLocations();
+    _loadPlanForMachine(null); // null = ALL PLAN
+  }
+
+  @override
+  void dispose() {
+    _searchDebounce?.cancel();
+    _searchController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _loadMachines() async {
+    try {
+      final rows = await SupabaseService.client
+          .from('app_machines')
+          .select('id,code,name')
+          .eq('active', true)
+          .order('code');
+
+      if (!mounted) return;
+      setState(() {
+        _machines = List<Map<String, dynamic>>.from(rows);
+      });
+    } catch (error) {
+      if (mounted) setState(() => _error = 'Machine list failed: $error');
+    }
+  }
+
+  Future<void> _loadRecentLocations() async {
+    try {
+      final rows = await SupabaseService.client
+          .from('v_current_coil_locations')
+          .select()
+          .order('scanned_at', ascending: false)
+          .limit(50);
+
+      if (!mounted) return;
+      setState(() {
+        _recentLocations = List<Map<String, dynamic>>.from(rows);
+      });
+    } catch (error) {
+      if (mounted) setState(() => _error = 'Location data failed: $error');
+    }
+  }
+
+  String _physicalCoilNoFromPpcRow(Map<String, dynamic> row) {
+    final mother = '${row['mother_coil'] ?? ''}'.trim();
+    final slit = '${row['slit_id'] ?? ''}'.trim();
+    if (mother.isEmpty) return slit;
+    if (slit.isEmpty) return mother;
+
+    final mu = mother.toUpperCase();
+    final su = slit.toUpperCase();
+    if (su.startsWith(mu)) return slit;
+    if (mu.endsWith(su)) return mother;
+    return '$mother$slit';
+  }
+
+  bool _ppcRowMatchesSearch(Map<String, dynamic> row, String query) {
+    final needle = query.trim().toUpperCase();
+    if (needle.isEmpty) return false;
+
+    final mother = '${row['mother_coil'] ?? ''}'.trim().toUpperCase();
+    final slit = '${row['slit_id'] ?? ''}'.trim().toUpperCase();
+    final physical = _physicalCoilNoFromPpcRow(row).toUpperCase();
+
+    final candidates = <String>{
+      if (mother.isNotEmpty) mother,
+      if (slit.isNotEmpty) slit,
+      if (physical.isNotEmpty) physical,
+      if (mother.isNotEmpty && slit.isNotEmpty) '$mother-$slit',
+      if (mother.isNotEmpty && slit.isNotEmpty) '$mother/$slit',
+    };
+
+    return candidates.any((candidate) => candidate.contains(needle));
+  }
+
+  Future<void> _loadPlanForMachine(String? machineCode) async {
+    _searchDebounce?.cancel();
+    _searchToken++;
+    if (!mounted) return;
+
+    setState(() {
+      _selectedMachine = machineCode;
+      _searchController.clear();
+      _searchResults = const [];
+      _selectedCoil = null;
+      _loading = true;
+      _error = null;
+      _planRows = const [];
+    });
+
+    try {
+      final plans = await SupabaseService.client
+          .from('ppc_plans')
+          .select('id')
+          .eq('is_active', true)
+          .order('imported_at', ascending: false)
+          .limit(1);
+
+      if (plans.isEmpty) {
+        if (mounted) {
+          setState(() {
+            _loading = false;
+            _error = 'No active PPC plan found.';
+          });
+        }
+        return;
+      }
+
+      final planId = plans.first['id'] as String;
+      var request = SupabaseService.client
+          .from('ppc_plan_rows')
+          .select(
+            'id,planned_machine_code,previous_stage_code,input_thickness,input_width,mother_coil,slit_id',
+          )
+          .eq('plan_id', planId);
+
+      if (machineCode != null) {
+        request = request.eq('planned_machine_code', machineCode);
+      }
+
+      final rows = await request.order('id').limit(5000);
+      final uniqueRows = <String, Map<String, dynamic>>{};
+
+      for (final raw in List<Map<String, dynamic>>.from(rows)) {
+        final physicalNo = _physicalCoilNoFromPpcRow(raw);
+        final key = physicalNo.isNotEmpty
+            ? physicalNo.toUpperCase()
+            : 'ROW:${raw['id']}';
+        uniqueRows.putIfAbsent(key, () => raw);
+      }
+
+      if (!mounted) return;
+      setState(() {
+        _planRows = uniqueRows.values.toList();
+        _loading = false;
+      });
+    } catch (_) {
+      if (!mounted) return;
+      setState(() {
+        _loading = false;
+        _error = 'Unable to load the active PPC plan.';
+      });
+    }
+  }
+
+  void _onSearchChanged(String value) {
+    _searchDebounce?.cancel();
+    final query = value.trim();
+
+    if (query.isEmpty) {
+      setState(() {
+        _searchResults = const [];
+        _selectedCoil = null;
+        _searching = false;
+        _error = null;
+      });
+      return;
+    }
+
+    setState(() {
+      _searching = true;
+      _error = null;
+      _selectedCoil = null;
+    });
+
+    final token = ++_searchToken;
+    _searchDebounce = Timer(const Duration(milliseconds: 250), () {
+      unawaited(_searchCoils(query, token));
+    });
+  }
+
+  Future<void> _searchCoils(String query, int token) async {
+    try {
+      final db = SupabaseService.client;
+      final needle = query.trim();
+      final selectedMachine = _selectedMachine;
+      if (needle.isEmpty) return;
+
+      final plans = await db
+          .from('ppc_plans')
+          .select('id')
+          .eq('is_active', true)
+          .order('imported_at', ascending: false)
+          .limit(1);
+
+      final merged = <String, Map<String, dynamic>>{};
+      final plannedMachines = <String, Set<String>>{};
+
+      if (plans.isNotEmpty) {
+        final planId = plans.first['id'];
+        var request = db
+            .from('ppc_plan_rows')
+            .select(
+              'id,planned_machine_code,previous_stage_code,input_thickness,input_width,mother_coil,slit_id',
+            )
+            .eq('plan_id', planId);
+
+        if (selectedMachine != null) {
+          request = request.eq('planned_machine_code', selectedMachine);
+        }
+
+        final rows = await request.order('id').limit(5000);
+
+        for (final raw in List<Map<String, dynamic>>.from(rows)) {
+          if (!_ppcRowMatchesSearch(raw, needle)) continue;
+
+          final physicalNo = _physicalCoilNoFromPpcRow(raw);
+          if (physicalNo.isEmpty) continue;
+
+          final key = physicalNo.toUpperCase();
+          final existing = merged[key];
+
+          if (existing == null) {
+            merged[key] = {
+              'id': null,
+              'coil_no': physicalNo,
+              'material_code': null,
+              'thickness': raw['input_thickness'],
+              'width': raw['input_width'],
+              'has_location': false,
+            };
+          } else {
+            existing['thickness'] ??= raw['input_thickness'];
+            existing['width'] ??= raw['input_width'];
+          }
+
+          final machine = '${raw['planned_machine_code'] ?? ''}'.trim();
+          if (machine.isNotEmpty) {
+            (plannedMachines[key] ??= <String>{}).add(machine);
+          }
+        }
+      }
+
+      // With ALL PLAN selected, also keep previously scanned physical coils
+      // searchable even when they are no longer in the active plan.
+      if (selectedMachine == null) {
+        final physicalRows = await db
+            .from('coils')
+            .select('id,coil_no,material_code,thickness,width')
+            .ilike('coil_no', '%$needle%')
+            .order('coil_no')
+            .limit(50);
+
+        for (final raw in List<Map<String, dynamic>>.from(physicalRows)) {
+          final coilNo = '${raw['coil_no'] ?? ''}'.trim();
+          if (coilNo.isEmpty) continue;
+          final key = coilNo.toUpperCase();
+          final existing = merged[key];
+
+          if (existing == null) {
+            merged[key] = {...raw, 'coil_no': coilNo};
+          } else {
+            existing['id'] ??= raw['id'];
+            existing['material_code'] ??= raw['material_code'];
+            existing['thickness'] ??= raw['thickness'];
+            existing['width'] ??= raw['width'];
+          }
+        }
+      }
+
+      if (!mounted || token != _searchToken) return;
+
+      final resultsBase = merged.values.toList()
+        ..sort((a, b) => '${a['coil_no']}'.compareTo('${b['coil_no']}'));
+
+      final coilNos = resultsBase
+          .map((row) => '${row['coil_no'] ?? ''}'.trim())
+          .where((value) => value.isNotEmpty)
+          .toList();
+
+      final locations = coilNos.isEmpty
+          ? const <dynamic>[]
+          : await db
+                .from('v_current_coil_locations')
+                .select()
+                .inFilter('coil_no', coilNos);
+
+      final locationByCoil = <String, Map<String, dynamic>>{};
+      for (final raw in List<Map<String, dynamic>>.from(locations)) {
+        final coilNo = '${raw['coil_no'] ?? ''}'.trim().toUpperCase();
+        if (coilNo.isNotEmpty) locationByCoil[coilNo] = raw;
+      }
+
+      final results = resultsBase.map((coil) {
+        final key = '${coil['coil_no'] ?? ''}'.trim().toUpperCase();
+        final location = locationByCoil[key];
+
+        return {
+          ...coil,
+          ...?location,
+          'has_location': location != null,
+          'planned_machines':
+              (plannedMachines[key] ?? const <String>{}).toList()..sort(),
+        };
+      }).toList();
+
+      if (!mounted || token != _searchToken) return;
+      setState(() {
+        _searchResults = results;
+        _searching = false;
+        _error = null;
+      });
+    } catch (_) {
+      if (!mounted || token != _searchToken) return;
+      setState(() {
+        _searchResults = const [];
+        _searching = false;
+        _error =
+            'Unable to search coil. Please check your connection and try again.';
+      });
+    }
+  }
+
+  void _selectSearchResult(Map<String, dynamic> coil) {
+    setState(() => _selectedCoil = coil);
+    _showCoilDetails(coil);
+  }
+
+  void _showCoilDetails(Map<String, dynamic> coil) {
+    final plannedMachines = List<String>.from(
+      (coil['planned_machines'] as List?) ?? const [],
+    );
+    showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      showDragHandle: true,
+      builder: (context) {
+        return SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(20, 6, 20, 28),
+            child: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      const Expanded(
+                        child: Text(
+                          'Coil Details & Last Location',
+                          style: AppTextStyles.sectionTitle,
+                        ),
+                      ),
+                      IconButton(
+                        onPressed: () => Navigator.pop(context),
+                        icon: const Icon(Icons.close),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 8),
+                  _detail('Coil No', '${coil['coil_no'] ?? '-'}'),
+                  _detail('Material Code', '${coil['material_code'] ?? '-'}'),
+                  _detail('Thickness', '${coil['thickness'] ?? '-'}'),
+                  _detail('Width', '${coil['width'] ?? '-'}'),
+                  _detail(
+                    'Planned Machine',
+                    plannedMachines.isEmpty
+                        ? 'NOT PLANNED'
+                        : plannedMachines.join(', '),
+                  ),
+                  _detail(
+                    'Location',
+                    coil['has_location'] == true
+                        ? '${coil['location_name'] ?? '-'}'
+                        : 'Not scanned yet',
+                  ),
+                  _detail(
+                    'Line',
+                    coil['has_location'] == true
+                        ? '${coil['line_name'] ?? '-'}'
+                        : '-',
+                  ),
+                  _detail(
+                    'Sequence',
+                    coil['has_location'] == true
+                        ? '${coil['sequence_no'] ?? '-'}'
+                        : '-',
+                  ),
+                  _detail(
+                    'Last Scan',
+                    coil['has_location'] == true
+                        ? '${coil['scanned_at'] ?? '-'}'
+                        : '-',
+                  ),
+                  _detail(
+                    'Operator',
+                    coil['has_location'] == true
+                        ? '${coil['operator_label'] ?? '-'}'
+                        : '-',
+                  ),
+                ],
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _detail(String label, String value) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 10),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          SizedBox(
+            width: 120,
+            child: Text(label, style: AppTextStyles.cardLabel),
+          ),
+          Expanded(
+            child: Text(
+              value,
+              maxLines: 3,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(fontWeight: FontWeight.w600),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final padding = constraints.maxWidth >= 700 ? 28.0 : 16.0;
+        return SingleChildScrollView(
+          padding: EdgeInsets.fromLTRB(padding, 20, padding, 32),
+          child: Center(
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 1150),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text('Check Location', style: AppTextStyles.pageTitle),
+                  const SizedBox(height: 8),
+                  const Text(
+                    'Search a Coil No. live, or select a PPC machine to inspect its current plan.',
+                    style: AppTextStyles.pageSubtitle,
+                  ),
+                  const SizedBox(height: 20),
+                  Card(
+                    child: Padding(
+                      padding: const EdgeInsets.all(18),
+                      child: LayoutBuilder(
+                        builder: (context, inner) {
+                          final controls = <Widget>[
+                            Expanded(child: _machineDropdown()),
+                            Expanded(child: _coilSearchField()),
+                          ];
+                          if (inner.maxWidth < 720) {
+                            return Column(
+                              children: [
+                                _machineDropdown(),
+                                const SizedBox(height: 12),
+                                _coilSearchField(),
+                              ],
+                            );
+                          }
+                          return Row(
+                            children: [
+                              controls[0],
+                              const SizedBox(width: 12),
+                              controls[1],
+                            ],
+                          );
+                        },
+                      ),
+                    ),
+                  ),
+                  if (_error != null) ...[
+                    const SizedBox(height: 12),
+                    Text(
+                      _error!,
+                      style: const TextStyle(color: AppColors.danger),
+                    ),
+                  ],
+                  if (_searchController.text.trim().isNotEmpty) ...[
+                    const SizedBox(height: 12),
+                    _searchResultsCard(),
+                  ],
+                  if (_selectedCoil != null) ...[
+                    const SizedBox(height: 12),
+                    _selectedCoilCard(_selectedCoil!),
+                  ],
+                  const SizedBox(height: 16),
+                  _machinePlanCard(),
+                  const SizedBox(height: 16),
+                  _recentScannedCard(),
+                ],
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _machineDropdown() {
+    return DropdownButtonFormField<String>(
+      initialValue: _selectedMachine,
+      isExpanded: true,
+      decoration: const InputDecoration(
+        labelText: 'PPC Machine',
+        prefixIcon: Icon(Icons.precision_manufacturing_rounded),
+      ),
+      items: [
+        const DropdownMenuItem<String>(
+          value: null,
+          child: Text(
+            'ALL PLAN',
+            style: TextStyle(fontWeight: FontWeight.w700),
+          ),
+        ),
+        for (final machine in _machines)
+          DropdownMenuItem<String>(
+            value: machine['code'] as String,
+            child: Text(
+              '${machine['code'] ?? machine['name']}',
+              overflow: TextOverflow.ellipsis,
+            ),
+          ),
+      ],
+      onChanged: _loadPlanForMachine,
+    );
+  }
+
+  Widget _coilSearchField() {
+    return TextField(
+      controller: _searchController,
+      textInputAction: TextInputAction.search,
+      onChanged: _onSearchChanged,
+      decoration: InputDecoration(
+        labelText: 'Search Coil No. live',
+        hintText: _selectedMachine == null
+            ? 'Type any part of Coil No.'
+            : 'Search coils on $_selectedMachine',
+        prefixIcon: const Icon(Icons.search_rounded),
+        suffixIcon: _searchController.text.isEmpty
+            ? null
+            : IconButton(
+                onPressed: () {
+                  _searchController.clear();
+                  _onSearchChanged('');
+                },
+                icon: const Icon(Icons.clear),
+              ),
+      ),
+    );
+  }
+
+  Widget _searchResultsCard() {
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                const Expanded(
+                  child: Text(
+                    'Matching coils',
+                    style: AppTextStyles.sectionTitle,
+                  ),
+                ),
+                if (_searching)
+                  const SizedBox(
+                    width: 18,
+                    height: 18,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  ),
+                if (!_searching)
+                  Text(
+                    '${_searchResults.length}',
+                    style: AppTextStyles.cardLabel,
+                  ),
+              ],
+            ),
+            const SizedBox(height: 10),
+            if (_searching)
+              const Padding(
+                padding: EdgeInsets.symmetric(vertical: 18),
+                child: Center(child: Text('Searching...')),
+              )
+            else if (_searchResults.isEmpty)
+              const Padding(
+                padding: EdgeInsets.symmetric(vertical: 18),
+                child: Text('No Coil No. found.'),
+              )
+            else
+              ..._searchResults.map(_searchResultTile),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _searchResultTile(Map<String, dynamic> coil) {
+    final scanned = coil['has_location'] == true;
+    final plannedMachines =
+        (coil['planned_machines'] as List?)?.map((e) => '$e').toList() ??
+        const <String>[];
+    return InkWell(
+      onTap: () => _selectSearchResult(coil),
+      child: Container(
+        width: double.infinity,
+        margin: const EdgeInsets.only(bottom: 8),
+        padding: const EdgeInsets.all(12),
+        decoration: BoxDecoration(
+          color: AppColors.surfaceSoft,
+          borderRadius: BorderRadius.circular(12),
+        ),
+        child: Row(
+          children: [
+            Icon(
+              scanned ? Icons.location_on_rounded : Icons.qr_code_rounded,
+              color: scanned ? AppColors.success : AppColors.textSecondary,
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    '${coil['coil_no']}',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(fontWeight: FontWeight.w700),
+                  ),
+                  const SizedBox(height: 3),
+                  Text(
+                    'T ${coil['thickness'] ?? '-'} × W ${coil['width'] ?? '-'}',
+                    style: AppTextStyles.cardLabel,
+                  ),
+                  Text(
+                    plannedMachines.isEmpty
+                        ? 'Not planned in active PPC'
+                        : 'Planned: ${plannedMachines.join(', ')}',
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      color: plannedMachines.isEmpty
+                          ? AppColors.textSecondary
+                          : AppColors.success,
+                      fontSize: 12,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                  const SizedBox(height: 2),
+                  Text(
+                    scanned
+                        ? '${coil['location_name'] ?? '-'} • ${coil['line_name'] ?? '-'}'
+                        : 'Not scanned yet',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: AppTextStyles.cardLabel,
+                  ),
+                ],
+              ),
+            ),
+            const Icon(Icons.chevron_right_rounded),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _selectedCoilCard(Map<String, dynamic> coil) {
+    return Card(
+      child: ListTile(
+        leading: const Icon(Icons.verified_rounded, color: AppColors.success),
+        title: Text(
+          '${coil['coil_no']}',
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+        ),
+        subtitle: Text(
+          'T ${coil['thickness'] ?? '-'} × W ${coil['width'] ?? '-'} • '
+          '${coil['has_location'] == true ? '${coil['location_name']} / ${coil['line_name']}' : 'Not scanned yet'}',
+          maxLines: 2,
+          overflow: TextOverflow.ellipsis,
+        ),
+        trailing: const Icon(Icons.info_outline_rounded),
+        onTap: () => _showCoilDetails(coil),
+      ),
+    );
+  }
+
+  Widget _machinePlanCard() {
+    if (_selectedMachine == null) {
+      return Card(
+        child: Padding(
+          padding: const EdgeInsets.all(28),
+          child: Column(
+            children: const [
+              Icon(Icons.precision_manufacturing_outlined, size: 46),
+              SizedBox(height: 12),
+              Text('Select a PPC machine', style: AppTextStyles.sectionTitle),
+              SizedBox(height: 6),
+              Text(
+                'Its latest active PPC plan rows will appear here.',
+                textAlign: TextAlign.center,
+                style: AppTextStyles.pageSubtitle,
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+
+    if (_loading) {
+      return const Card(
+        child: Padding(
+          padding: EdgeInsets.all(40),
+          child: Center(child: CircularProgressIndicator()),
+        ),
+      );
+    }
+
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(20),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    'PPC Plan • $_selectedMachine',
+                    style: AppTextStyles.sectionTitle,
+                  ),
+                ),
+                Text(
+                  '${_planRows.length} coils',
+                  style: AppTextStyles.cardLabel,
+                ),
+              ],
+            ),
+            const SizedBox(height: 12),
+            if (_planRows.isEmpty)
+              const Text(
+                'No plan rows found for this machine.',
+                style: AppTextStyles.pageSubtitle,
+              )
+            else
+              ..._planRows.take(100).map(_planRow),
+            if (_planRows.length > 100)
+              const Padding(
+                padding: EdgeInsets.only(top: 8),
+                child: Text(
+                  'Showing the first 100 physical coils in test mode.',
+                  style: AppTextStyles.cardLabel,
+                ),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _planRow(Map<String, dynamic> row) {
+    return Container(
+      width: double.infinity,
+      margin: const EdgeInsets.only(bottom: 8),
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: AppColors.surfaceSoft,
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Wrap(
+        spacing: 12,
+        runSpacing: 6,
+        children: [
+          Text(
+            'T ${row['input_thickness'] ?? '-'}',
+            style: AppTextStyles.cardLabel,
+          ),
+          Text(
+            'W ${row['input_width'] ?? '-'}',
+            style: AppTextStyles.cardLabel,
+          ),
+          Text(
+            'Coil ${row['mother_coil'] ?? '-'}',
+            style: AppTextStyles.cardLabel,
+          ),
+          Text('Slit ${row['slit_id'] ?? '-'}', style: AppTextStyles.cardLabel),
+        ],
+      ),
+    );
+  }
+
+  Widget _recentScannedCard() {
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(20),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                const Expanded(
+                  child: Text(
+                    'Latest Verified Coil Locations',
+                    style: AppTextStyles.sectionTitle,
+                  ),
+                ),
+                IconButton(
+                  tooltip: 'Refresh',
+                  onPressed: _loadRecentLocations,
+                  icon: const Icon(Icons.refresh_rounded),
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            if (_recentLocations.isEmpty)
+              const Text(
+                'No scanned coil locations available yet.',
+                style: AppTextStyles.pageSubtitle,
+              )
+            else
+              ..._recentLocations.map(
+                (coil) => InkWell(
+                  onTap: () =>
+                      _showCoilDetails({...coil, 'has_location': true}),
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 8),
+                    child: Row(
+                      children: [
+                        const Icon(
+                          Icons.qr_code_rounded,
+                          color: AppColors.navy,
+                          size: 20,
+                        ),
+                        const SizedBox(width: 10),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                '${coil['coil_no']}',
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(
+                                  fontWeight: FontWeight.w700,
+                                ),
+                              ),
+                              Text(
+                                '${coil['location_name']} • ${coil['line_name']}',
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: AppTextStyles.cardLabel,
+                              ),
+                            ],
+                          ),
+                        ),
+                        Text(
+                          '#${coil['sequence_no']}',
+                          style: AppTextStyles.cardLabel,
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+
+==============================
+===== PPC IMPORT SERVICE =====
+==============================
+import 'dart:typed_data';
+
+import 'package:excel/excel.dart';
+
+import 'supabase_service.dart';
+
+class PpcImportResult {
+  const PpcImportResult({
+    required this.rowsImported,
+    required this.rowsSkipped,
+    required this.machineCodes,
+    required this.planId,
+  });
+
+  final int rowsImported;
+  final int rowsSkipped;
+  final List<String> machineCodes;
+  final String planId;
+}
+
+class PpcImportService {
+  const PpcImportService();
+
+  Future<PpcImportResult> importXlsx({
+    required Uint8List bytes,
+    required String fileName,
+  }) async {
+    final workbook = Excel.decodeBytes(bytes);
+
+    if (workbook.tables.isEmpty) {
+      throw const FormatException('No worksheet found in the Excel file.');
+    }
+
+    final sheet = workbook.tables.values.first;
+    final rows = sheet.rows;
+
+    if (rows.length < 2) {
+      throw const FormatException('Excel file does not contain planning data.');
+    }
+
+    final headers = rows.first.map(_cellText).map(_normalizeHeader).toList();
+
+    int requiredColumn(List<String> aliases, String displayName) {
+      for (final alias in aliases) {
+        final index = headers.indexOf(_normalizeHeader(alias));
+        if (index != -1) return index;
+      }
+      throw FormatException('Required Excel column not found: $displayName');
+    }
+
+    int? optionalColumn(List<String> aliases) {
+      for (final alias in aliases) {
+        final index = headers.indexOf(_normalizeHeader(alias));
+        if (index != -1) return index;
+      }
+      return null;
+    }
+
+    final machineIndex = requiredColumn(const [
+      'Planned Work Center',
+      'Planned Workcentre',
+      'Work Center',
+      'Workcentre',
+    ], 'Planned Work Center');
+
+    final previousStageIndex = optionalColumn(const [
+      'Previous Stage Work Center',
+      'Previous Stage Workcentre',
+      'Previous Work Center',
+    ]);
+
+    final thicknessIndex = optionalColumn(const [
+      'Input Thickness',
+      'Thickness',
+    ]);
+
+    final widthIndex = optionalColumn(const ['Input Width', 'Width']);
+
+    final motherCoilIndex = optionalColumn(const [
+      'Mother Coil',
+      'Mother Coil No',
+      'Mother Coil Number',
+    ]);
+
+    final slitIdIndex = optionalColumn(const [
+      'Slit ID',
+      'Slit Id',
+      'Slit No',
+      'Slit Number',
+    ]);
+
+    final importedRows = <Map<String, dynamic>>[];
+    final machineCodes = <String>{};
+    var skipped = 0;
+
+    for (var rowIndex = 1; rowIndex < rows.length; rowIndex++) {
+      final row = rows[rowIndex];
+
+      final machineCode = _cellText(_cellAt(row, machineIndex));
+      final previousStage = _cellText(_cellAt(row, previousStageIndex));
+      final thickness = _parseDouble(_cellText(_cellAt(row, thicknessIndex)));
+      final width = _parseDouble(_cellText(_cellAt(row, widthIndex)));
+      final motherCoil = _cellText(_cellAt(row, motherCoilIndex));
+      final slitId = _cellText(_cellAt(row, slitIdIndex));
+
+      final completelyEmpty =
+          machineCode.isEmpty &&
+          previousStage.isEmpty &&
+          motherCoil.isEmpty &&
+          slitId.isEmpty &&
+          thickness == null &&
+          width == null;
+
+      if (completelyEmpty || machineCode.isEmpty) {
+        skipped++;
+        continue;
+      }
+
+      importedRows.add({
+        'planned_machine_code': machineCode,
+        'previous_stage_code': previousStage.isEmpty ? null : previousStage,
+        'input_thickness': thickness,
+        'input_width': width,
+        'mother_coil': motherCoil.isEmpty ? null : motherCoil,
+        'slit_id': slitId.isEmpty ? null : slitId,
+      });
+
+      machineCodes.add(machineCode);
+    }
+
+    if (importedRows.isEmpty) {
+      throw const FormatException('No valid PPC planning rows found.');
+    }
+
+    final db = SupabaseService.client;
+
+    // Keep the current plan active until the new plan is completely imported.
+    final plan = await db
+        .from('ppc_plans')
+        .insert({
+          'file_name': fileName,
+          'row_count': importedRows.length,
+          'is_active': false,
+        })
+        .select('id')
+        .single();
+
+    final planId = plan['id'] as String;
+
+    const chunkSize = 200;
+
+    for (var start = 0; start < importedRows.length; start += chunkSize) {
+      final end = (start + chunkSize > importedRows.length)
+          ? importedRows.length
+          : start + chunkSize;
+
+      final chunk = importedRows.sublist(start, end).map((row) {
+        return {...row, 'plan_id': planId};
+      }).toList();
+
+      await db.from('ppc_plan_rows').insert(chunk);
+    }
+
+    // A physical coil is represented once in the master table even when the
+    // same Coil/Mother Coil appears in many PPC planning rows. PPC rows are
+    // intentionally preserved because they represent separate planning data.
+    String physicalCoilNo(String mother, String slit) {
+      final m = mother.trim();
+      final s = slit.trim();
+      if (m.isEmpty) return s;
+      if (s.isEmpty) return m;
+
+      final mu = m.toUpperCase();
+      final su = s.toUpperCase();
+      if (su.startsWith(mu)) return s;
+      if (mu.endsWith(su)) return m;
+      return '$m$s';
+    }
+
+    final uniqueCoils = <String, Map<String, dynamic>>{};
+    for (final row in importedRows) {
+      final coilNo = physicalCoilNo(
+        '${row['mother_coil'] ?? ''}',
+        '${row['slit_id'] ?? ''}',
+      ).trim();
+      if (coilNo.isEmpty) continue;
+
+      uniqueCoils.putIfAbsent(
+        coilNo.toUpperCase(),
+        () => {
+          'coil_no': coilNo,
+          'thickness': row['input_thickness'],
+          'width': row['input_width'],
+        },
+      );
+    }
+
+    if (uniqueCoils.isNotEmpty) {
+      final coilRows = uniqueCoils.values.map((row) {
+        return {
+          'coil_no': row['coil_no'],
+          'thickness': row['thickness'],
+          'width': row['width'],
+        };
+      }).toList();
+
+      for (var start = 0; start < coilRows.length; start += chunkSize) {
+        final end = (start + chunkSize > coilRows.length)
+            ? coilRows.length
+            : start + chunkSize;
+        await db
+            .from('coils')
+            .upsert(coilRows.sublist(start, end), onConflict: 'coil_no');
+      }
+    }
+
+    // Activate the new plan only after every row and physical-coil seed
+    // has been written successfully. Old plans remain in history.
+    await db
+        .from('ppc_plans')
+        .update({'is_active': false})
+        .eq('is_active', true);
+
+    await db.from('ppc_plans').update({'is_active': true}).eq('id', planId);
+
+    return PpcImportResult(
+      rowsImported: importedRows.length,
+      rowsSkipped: skipped,
+      machineCodes: machineCodes.toList()..sort(),
+      planId: planId,
+    );
+  }
+
+  dynamic _cellAt(List<dynamic> row, int? index) {
+    if (index == null || index < 0 || index >= row.length) {
+      return null;
+    }
+    return row[index];
+  }
+
+  String _cellText(dynamic cell) {
+    if (cell == null) return '';
+
+    final value = cell.value;
+    if (value == null) return '';
+
+    return value.toString().trim();
+  }
+
+  double? _parseDouble(String value) {
+    if (value.isEmpty) return null;
+
+    final cleaned = value
+        .replaceAll(',', '')
+        .replaceAll(RegExp(r'[^0-9.+-]'), '');
+
+    return double.tryParse(cleaned);
+  }
+
+  String _normalizeHeader(String value) {
+    return value.trim().replaceAll(RegExp(r'\s+'), ' ').toLowerCase();
+  }
+}
+
+
+==============================
+===== CURRENT BUSINESS MIGRATION =====
+==============================
+-- Steel Coil Tracking V2 business-logic migration
+-- Apply this in Supabase SQL Editor against the DEV schema.
+
+create index if not exists idx_ppc_plan_rows_plan_machine
+  on public.ppc_plan_rows(plan_id, planned_machine_code);
+
+create index if not exists idx_ppc_plan_rows_mother
+  on public.ppc_plan_rows(mother_coil);
+
+create index if not exists idx_ppc_plan_rows_slit
+  on public.ppc_plan_rows(slit_id);
+
+create or replace function public.record_coil_scan(
+  p_session_id uuid,
+  p_coil_no text,
+  p_material_code text,
+  p_thickness numeric,
+  p_width numeric,
+  p_location_id uuid,
+  p_line_id uuid,
+  p_operator_label text default 'Operator'
+)
+returns table(
+  scan_id uuid,
+  coil_id uuid,
+  sequence_no integer,
+  scanned_at timestamptz,
+  is_duplicate boolean
+)
+language plpgsql
+security definer
+set search_path to 'public'
+as $function$
+declare
+  v_coil_id uuid;
+  v_scan_id uuid;
+  v_seq integer;
+  v_scanned_at timestamptz := now();
+  v_lock_key bigint;
+begin
+  -- Physical Coil No is case-insensitive for tracking purposes.
+  p_coil_no := upper(trim(p_coil_no));
+  p_material_code := trim(p_material_code);
+  p_operator_label := coalesce(nullif(trim(p_operator_label), ''), 'Operator');
+
+  if p_coil_no = '' then
+    raise exception 'Coil No cannot be empty';
+  end if;
+
+  -- Same physical coil scanned twice in the same session is a duplicate.
+  select cs.id, cs.coil_id, cs.sequence_no, cs.scanned_at
+    into v_scan_id, v_coil_id, v_seq, v_scanned_at
+  from public.coil_scans cs
+  join public.coils c on c.id = cs.coil_id
+  where cs.session_id = p_session_id
+    and upper(trim(c.coil_no)) = p_coil_no
+  order by cs.scanned_at
+  limit 1;
+
+  if v_scan_id is not null then
+    scan_id := v_scan_id;
+    coil_id := v_coil_id;
+    sequence_no := v_seq;
+    scanned_at := v_scanned_at;
+    is_duplicate := true;
+    return next;
+    return;
+  end if;
+
+  insert into public.coils(
+    coil_no, material_code, thickness, width, updated_at
+  )
+  values (
+    p_coil_no,
+    nullif(p_material_code, ''),
+    p_thickness,
+    p_width,
+    now()
+  )
+  on conflict (coil_no) do update
+    set material_code = coalesce(excluded.material_code, public.coils.material_code),
+        thickness = coalesce(excluded.thickness, public.coils.thickness),
+        width = coalesce(excluded.width, public.coils.width),
+        updated_at = now()
+  returning id into v_coil_id;
+
+  -- Numbering belongs to the scan session.
+  -- Every new session therefore starts at 1, independently for every
+  -- Location + Line combination selected by the operator.
+  v_lock_key := hashtextextended(p_session_id::text, 0);
+  perform pg_advisory_xact_lock(v_lock_key);
+
+  select coalesce(max(cs.sequence_no), 0) + 1
+    into v_seq
+  from public.coil_scans cs
+  where cs.session_id = p_session_id;
+
+  insert into public.coil_scans(
+    session_id,
+    coil_id,
+    location_id,
+    line_id,
+    sequence_no,
+    scanned_at,
+    operator_label
+  )
+  values (
+    p_session_id,
+    v_coil_id,
+    p_location_id,
+    p_line_id,
+    v_seq,
+    v_scanned_at,
+    p_operator_label
+  )
+  returning id into v_scan_id;
+
+  scan_id := v_scan_id;
+  coil_id := v_coil_id;
+  sequence_no := v_seq;
+  scanned_at := v_scanned_at;
+  is_duplicate := false;
+  return next;
+end;
+$function$;
+
+-- Optional helper for SQL-side verification of the active plan.
+create or replace view public.v_active_ppc_coils as
+select
+  p.id as plan_id,
+  p.file_name,
+  p.imported_at,
+  r.id as plan_row_id,
+  r.planned_machine_code,
+  r.previous_stage_code,
+  r.input_thickness,
+  r.input_width,
+  r.mother_coil,
+  r.slit_id,
+  case
+    when nullif(trim(r.slit_id), '') is null
+      then trim(r.mother_coil)
+    when upper(trim(r.slit_id)) like upper(trim(r.mother_coil)) || '%'
+      then trim(r.slit_id)
+    when upper(trim(r.mother_coil)) like '%' || upper(trim(r.slit_id))
+      then trim(r.mother_coil)
+    else trim(r.mother_coil) || trim(r.slit_id)
+  end as physical_coil_no
+from public.ppc_plans p
+join public.ppc_plan_rows r on r.plan_id = p.id
+where p.is_active = true;
+
+-- Verification:
+-- select physical_coil_no, array_agg(distinct planned_machine_code order by planned_machine_code)
+-- from public.v_active_ppc_coils
+-- group by physical_coil_no
+-- order by physical_coil_no;
+
+
+==============================
+===== CURRENT ANALYZE =====
+==============================
+Analyzing steel_coil_tracking_v2...                             
+No issues found! (ran in 1.7s)
+
+==============================
+===== CURRENT TEST =====
+==============================
+00:00 +0: loading C:/Users/sanje/steel_coil_tracking_v2/test/qr_parser_service_test.dart
+00:00 +0: parses the supplied coil QR format
+00:00 +1: rejects an invalid size
+00:00 +2: All tests passed!

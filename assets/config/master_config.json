@@ -1,0 +1,49 @@
+﻿{
+  "locations": [
+    {
+      "id": "LOC-TLL",
+      "code": "TLL",
+      "name": "TLL",
+      "type": "Process Area",
+      "active": true
+    },
+    {
+      "id": "LOC-SKINPASS",
+      "code": "SKINPASS",
+      "name": "Skinpass",
+      "type": "Process Area",
+      "active": true
+    },
+    {
+      "id": "LOC-YARD-A",
+      "code": "YARD-A",
+      "name": "Yard A",
+      "type": "Storage",
+      "active": true
+    }
+  ],
+  "machines": [
+    { "id": "M-01", "code": "CRS00001", "name": "CRS 01", "active": true },
+    { "id": "M-02", "code": "CRS00002", "name": "CRS 02", "active": true },
+    { "id": "M-03", "code": "CRS00003", "name": "CRS 03", "active": true },
+    { "id": "M-04", "code": "CRS00004", "name": "CRS 04", "active": true },
+    { "id": "M-05", "code": "CRS00005", "name": "CRS 05", "active": true },
+    { "id": "M-06", "code": "CRS00006", "name": "CRS 06", "active": true },
+    { "id": "M-07", "code": "CRS00007", "name": "CRS 07", "active": true },
+    { "id": "M-08", "code": "CRS00008", "name": "CRS 08", "active": true },
+    { "id": "M-09", "code": "CRS00009", "name": "CRS 09", "active": true },
+    { "id": "M-10", "code": "CRS00010", "name": "CRS 10", "active": true }
+  ],
+  "lines": [
+    { "id": "L-01", "code": "LINE-01", "name": "Line 01", "machineId": "M-01", "active": true },
+    { "id": "L-02", "code": "LINE-02", "name": "Line 02", "machineId": "M-02", "active": true },
+    { "id": "L-03", "code": "LINE-03", "name": "Line 03", "machineId": "M-03", "active": true },
+    { "id": "L-04", "code": "LINE-04", "name": "Line 04", "machineId": "M-04", "active": true },
+    { "id": "L-05", "code": "LINE-05", "name": "Line 05", "machineId": "M-05", "active": true },
+    { "id": "L-06", "code": "LINE-06", "name": "Line 06", "machineId": "M-06", "active": true },
+    { "id": "L-07", "code": "LINE-07", "name": "Line 07", "machineId": "M-07", "active": true },
+    { "id": "L-08", "code": "LINE-08", "name": "Line 08", "machineId": "M-08", "active": true },
+    { "id": "L-09", "code": "LINE-09", "name": "Line 09", "machineId": "M-09", "active": true },
+    { "id": "L-10", "code": "LINE-10", "name": "Line 10", "machineId": "M-10", "active": true }
+  ]
+}
