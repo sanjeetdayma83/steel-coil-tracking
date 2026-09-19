@@ -1,4 +1,4 @@
-﻿import 'dart:async';
+import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -542,13 +542,11 @@ class _ScanCoilScreenState extends State<ScanCoilScreen>
   Future<List<String>> _plannedMachinesForCoil(String coilNo) async {
     final normalized = coilNo.trim().toUpperCase();
     if (normalized.isEmpty) return const [];
-
     try {
       final rows = await SupabaseService.client.rpc(
         'match_planned_machines',
         params: {'p_coil_no': normalized},
       );
-
       final codes = <String>{};
       for (final row in List<Map<String, dynamic>>.from(rows as List)) {
         final code = '${row['planned_machine_code'] ?? ''}'.trim();
@@ -599,7 +597,7 @@ class _ScanCoilScreenState extends State<ScanCoilScreen>
         : 'LOCATION AVAILABLE';
     final entry = OverlayEntry(
       builder: (overlayContext) {
-        final width = MediaQuery.sizeOf(overlayContext).width;
+        final screenW = MediaQuery.sizeOf(overlayContext).width;
         return Positioned(
           top: MediaQuery.paddingOf(overlayContext).top + 14,
           left: 12,
@@ -608,7 +606,9 @@ class _ScanCoilScreenState extends State<ScanCoilScreen>
             bottom: false,
             child: Center(
               child: ConstrainedBox(
-                constraints: BoxConstraints(maxWidth: width >= 700 ? 560 : 520),
+                constraints: BoxConstraints(
+                  maxWidth: screenW >= 700 ? 560 : 520,
+                ),
                 child: Material(
                   elevation: 12,
                   borderRadius: BorderRadius.circular(16),
@@ -936,73 +936,54 @@ class _ScanCoilScreenState extends State<ScanCoilScreen>
             child: Stack(
               fit: StackFit.expand,
               children: [
-                // The scanner widget stays mounted even while paused.
-                // This prevents controllerNotAttached start races.
                 MobileScanner(controller: _camera, onDetect: _onDetect),
                 IgnorePointer(
                   child: Center(
                     child: Container(
-                      width: 250,
-                      height: 175,
+                      width: 220,
+                      height: 160,
                       decoration: BoxDecoration(
                         border: Border.all(color: Colors.white, width: 2),
-                        borderRadius: BorderRadius.circular(18),
+                        borderRadius: BorderRadius.circular(16),
                       ),
                     ),
                   ),
                 ),
-                Positioned(
-                  left: 16,
-                  right: 16,
-                  bottom: 16,
-                  child: LayoutBuilder(
-                    builder: (context, constraints) {
-                      final compact = constraints.maxWidth < 430;
-                      final buttonWidth = compact
-                          ? (constraints.maxWidth - 10) / 2
-                          : (constraints.maxWidth - 20) / 3;
-                      return Wrap(
-                        spacing: 10,
-                        runSpacing: 10,
-                        children: [
-                          SizedBox(
-                            width: buttonWidth,
-                            child: _CameraButton(
-                              icon: running
-                                  ? Icons.pause_rounded
-                                  : Icons.play_arrow_rounded,
-                              label: running ? 'Pause' : 'Start',
-                              onTap: running
-                                  ? () => _stopCamera(updateUi: true)
-                                  : _startCamera,
-                            ),
-                          ),
-                          SizedBox(
-                            width: buttonWidth,
-                            child: _CameraButton(
-                              icon: Icons.flash_on_rounded,
-                              label: 'Torch',
-                              onTap: () async {
-                                if (_isRunning) {
-                                  await _camera.toggleTorch();
-                                }
-                              },
-                            ),
-                          ),
-                          SizedBox(
-                            width: buttonWidth,
-                            child: _CameraButton(
-                              icon: Icons.flip_camera_android_rounded,
-                              label: 'Camera',
-                              onTap: () async {
-                                if (_isRunning) {
-                                  await _camera.switchCamera();
-                                }
-                              },
-                            ),
-                          ),
-                        ],
-                      );
+              ],
+            ),
+          ),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(12, 12, 12, 4),
+            child: Row(
+              children: [
+                Expanded(
+                  child: _CameraButton(
+                    icon: running
+                        ? Icons.pause_rounded
+                        : Icons.play_arrow_rounded,
+                    label: running ? 'Pause' : 'Start',
+                    onTap: running
+                        ? () => _stopCamera(updateUi: true)
+                        : _startCamera,
+                  ),
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: _CameraButton(
+                    icon: Icons.flash_on_rounded,
+                    label: 'Torch',
+                    onTap: () async {
+                      if (_isRunning) await _camera.toggleTorch();
+                    },
+                  ),
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: _CameraButton(
+                    icon: Icons.flip_camera_android_rounded,
+                    label: 'Camera',
+                    onTap: () async {
+                      if (_isRunning) await _camera.switchCamera();
                     },
                   ),
                 ),

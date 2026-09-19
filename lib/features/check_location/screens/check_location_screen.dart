@@ -129,8 +129,25 @@ class _CheckLocationScreenState extends State<CheckLocationScreen> {
         uniqueRows.putIfAbsent(physical, () => {...raw, 'coil_no': physical});
       }
 
-      // Attach latest location for each plan physical coil
-      final physicals = uniqueRows.keys.toList();
+      // Attach latest location — match plan physical AND scanned-style
+      // Plan may store 26T124350AB while scan stores 26T124350B
+      // Rebuild: (mother without last letter) + slit
+      final fetchKeys = <String>{};
+      for (final row in uniqueRows.values) {
+        final physical = '${row['coil_no'] ?? ''}'.trim().toUpperCase();
+        if (physical.isNotEmpty) fetchKeys.add(physical);
+
+        final mother = '${row['mother_coil'] ?? ''}'.trim().toUpperCase();
+        final slit = '${row['slit_id'] ?? ''}'.trim().toUpperCase();
+        if (mother.length > 1 && slit.isNotEmpty) {
+          fetchKeys.add(mother.substring(0, mother.length - 1) + slit);
+        }
+        if (mother.isNotEmpty && slit.isNotEmpty) {
+          fetchKeys.add(mother + slit);
+        }
+      }
+
+      final physicals = fetchKeys.toList();
       final locRows = physicals.isEmpty
           ? const <dynamic>[]
           : await db
@@ -147,11 +164,24 @@ class _CheckLocationScreenState extends State<CheckLocationScreen> {
       final enriched = <Map<String, dynamic>>[];
       for (final row in uniqueRows.values) {
         final key = '${row['coil_no'] ?? ''}'.trim().toUpperCase();
-        final loc = locByCoil[key];
+        final mother = '${row['mother_coil'] ?? ''}'.trim().toUpperCase();
+        final slit = '${row['slit_id'] ?? ''}'.trim().toUpperCase();
+
+        String? rebuilt;
+        if (mother.length > 1 && slit.isNotEmpty) {
+          rebuilt = mother.substring(0, mother.length - 1) + slit;
+        }
+
+        final loc =
+            locByCoil[key] ??
+            (rebuilt != null ? locByCoil[rebuilt] : null) ??
+            (mother.isNotEmpty && slit.isNotEmpty
+                ? locByCoil[mother + slit]
+                : null);
+
         final machines = <String>{};
         final code = '${row['planned_machine_code'] ?? ''}'.trim();
         if (code.isNotEmpty) machines.add(code);
-        // also smart-match for scanned-style numbers
 
         enriched.add({
           ...row,
